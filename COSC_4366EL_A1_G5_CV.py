@@ -7,12 +7,12 @@ Credits: Syed Ali; Roboflow; Gemini
 
 # Dictionary mapping AprilTag IDs to navigation actions
 SIGN_MAP = {
-    0: "TURN LEFT",
-    1: "TURN RIGHT",
-    2: "GO FORWARD",
-    3: "STOP",
-    4: "NO ENTRY",
-    5: "DEAD END"
+    0: "NO ENTRY",
+    1: "DEAD END",
+    2: "RIGHT",
+    3: "LEFT",
+    4: "FORWARD",
+    5: "STOP"
 }
 
 

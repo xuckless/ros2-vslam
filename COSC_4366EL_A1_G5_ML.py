@@ -40,7 +40,7 @@ def trackSign_ML(frame, model):
 
 
 def main():
-    # Load the trained YOLO model (Replace 'best_yolo.pt' with your actual exported weights file)
+    # Load the trained YOLO model
     try:
         model = YOLO("best_yolo.pt")
     except Exception as e:
