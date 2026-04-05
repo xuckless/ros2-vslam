@@ -42,7 +42,7 @@ class LimoNavigationNode(Node):
         self.eval_duration = 1.2
 
         self.timer = self.create_timer(0.1, self.update_state)
-        self.get_logger().info('Optimized Vision Node Started (Green/Orange/White + ROI Top 20% Clipped)')
+        self.get_logger().info('Running LIMO')
 
     def update_state(self):
         now = self.get_clock().now()
@@ -119,9 +119,11 @@ class LimoNavigationNode(Node):
         white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
 
         h, w = green_mask.shape
-        top_offset = int(h * 0.2)  # Top 20% cutoff
 
         # --- Trapezoid ROI Setup ---
+        # Ignore top 40%, covering only the bottom 60% of the image.
+        top_offset = int(h * 0.3)
+
         pts = np.array([
             [0, h],
             [w, h],
