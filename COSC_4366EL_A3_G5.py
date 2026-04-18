@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+vision_slam_node.py
+
+ROS2 autonomous navigation node for the AgileX LIMO robot.
+Combines dual-PID green-line following (Heading + Lateral offset)
+with YOLO sign detection and a priority-driven, interrupt-capable state machine.
+
+Distance Estimation : Floor-projection model  — D = K / (H_img - box_bottom_y)
+Angle Estimation    : Dynamic full-frame extraction. Evaluates both heading angle
+                      and lateral pixel offset independently for robust recentering.
+"""
+
+import math
+import threading
+
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy, qos_profile_sensor_data)
+from sensor_msgs.msg import Image
+from ultralytics import YOLO
+
+# ============================================================
+#  CONFIGURATION CONSTANTS
+# ============================================================
+
+# -- Odometry topic candidates -------
+ODOM_TOPIC_CANDIDATES = [
+    '/odom',
+    '/limo_base/odom',
+    '/ackermann_odom',
+    '/wheel/odom',
+]
+
+# -- Camera --------------------------------------------------
+CAMERA_TOPIC = '/camera/color/image_raw'
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
+IMAGE_CENTER_X = IMAGE_WIDTH // 2
+OVERLAY_ALPHA = 0.5
+
+# -- Floor-Projection Distance Model -------------------------
+FLOOR_DIST_K = 5000.0
+ACTION_DISTANCE_CM = 60.0
+MIN_BOX_HEIGHT_PX = 10
+
+# -- HSV Green Tape Segmentation -----------------------------
+HSV_LOWER_GREEN = np.array([35, 40, 40])
+HSV_UPPER_GREEN = np.array([85, 255, 255])
+MIN_CONTOUR_AREA = 1000
+HORIZONTAL_THRESHOLD_DEG = 65
+
+# -- YOLO ----------------------------------------------------
+YOLO_MODEL_PATH = "best_yolo.pt"
+YOLO_CONFIDENCE = 0.5
+
+# -- ROS -----------------------------------------------------
+QOS_DEPTH = 10
+PUBLISHER_QUEUE_SIZE = 10
+CONTROL_LOOP_HZ = 10
+CONTROL_LOOP_PERIOD = 1.0 / CONTROL_LOOP_HZ
+
+# -- Movement & Dual-PID Control -----------------------------
+FORWARD_SPEED = 0.15  # m/s base speed
+TURN_SPEED = 0.30  # rad/s bang-bang for sign turns
+
+# Heading PID Gains (Radians)
+KP_HEADING = 1.5
+KI_HEADING = 0.05  # Nudges out steady-state mechanical bias
+KD_HEADING = 0.20  # Dampens oscillations (fishtailing)
+
+# Lateral PID Gains (Pixels)
+KP_LATERAL = 0.004
+KI_LATERAL = 0.0001
+KD_LATERAL = 0.001
+
+MAX_INTEGRAL_WINDUP = 1.0  # Caps the I-term so it doesn't spool to infinity
+MAX_ANGULAR_CORRECTION = 0.40  # rad/s clamp on final output
+MAX_HEADING_TO_DRIVE = 0.25  # rad: drive forward only below this error
+SEVERE_LATERAL_OFFSET = 60  # px: if offset > this, slow down to recover
+
+# -- State Machine Timing & Distances ------------------------
+STOP_DURATION_SEC = 3.0
+SEARCH_TURN_SPEED = 0.20
+SEARCH_TIMEOUT_SEC = 4.0
+SEARCH_PATH_ANGLE = 0.40
+TURN_DONE_THRESH = 0.08
+SIGN_COOLDOWN_SEC = 5.0
+
+# Multiplier to delay the exact point of turning (1.0 = turn exactly at sign distance)
+TURN_DISTANCE_MULTIPLIER = 1.2
+
+# -- Action Priority -----------------------------------------
+ACTION_PRIORITY = {
+    "NO ENTRY": 4,
+    "DEAD END": 4,
+    "STOP": 3,
+    "RIGHT": 2,
+    "LEFT": 2,
+    "FORWARD": 1,
+}
+IDLE_PRIORITY = 0
+
+
+# ============================================================
+#  VISION PROCESSOR
+# ============================================================
+
+class VisionProcessor:
+
+    def __init__(self, model_path: str, confidence: float):
+        self.confidence = confidence
+        try:
+            self.model = YOLO(model_path)
+            print("[VisionProcessor] YOLO model loaded.")
+        except Exception as exc:
+            print(f"[VisionProcessor] YOLO load error: {exc}")
+            self.model = None
+
+    @staticmethod
+    def floor_distance(box_bottom_y: float) -> float:
+        denom = IMAGE_HEIGHT - box_bottom_y
+        if denom < 1:
+            return math.inf
+        return FLOOR_DIST_K / denom
+
+    @staticmethod
+    def extract_errors(contour: np.ndarray):
+        [vx, vy, cx, cy] = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx, vy = float(vx), float(vy)
+        if vy > 0:
+            vx, vy = -vx, -vy
+        heading_err = math.atan2(vx, -vy)
+
+        M = cv2.moments(contour)
+        if M['m00'] > 0:
+            centroid_x = M['m10'] / M['m00']
+            lateral_err_px = centroid_x - IMAGE_CENTER_X
+        else:
+            lateral_err_px = 0.0
+
+        return heading_err, lateral_err_px
+
+    def process_frame(self, frame: np.ndarray):
+        frame = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT))
+        display = frame.copy()
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((5, 5), np.uint8)
+
+        green_mask = cv2.inRange(hsv, HSV_LOWER_GREEN, HSV_UPPER_GREEN)
+        green_mask = cv2.dilate(green_mask, kernel, iterations=4)
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+
+        overlay = cv2.bitwise_and(frame, frame, mask=green_mask)
+        cv2.addWeighted(overlay, OVERLAY_ALPHA, display, 1 - OVERLAY_ALPHA, 0, display)
+
+        cv2.line(display, (IMAGE_CENTER_X, 0), (IMAGE_CENTER_X, IMAGE_HEIGHT), (255, 0, 0), 1)
+
+        line_ok = False
+        heading_err = 0.0
+        lat_err_px = 0.0
+
+        contours, _ = cv2.findContours(
+            green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        valid_contours = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) > MIN_CONTOUR_AREA:
+                [vx, vy, cx, cy] = cv2.fitLine(cnt, cv2.DIST_L2, 0, 0.01, 0.01)
+                vx, vy = float(vx), float(vy)
+                if vy > 0:
+                    vx, vy = -vx, -vy
+
+                angle_from_vertical = abs(math.degrees(math.atan2(vx, -vy)))
+                if angle_from_vertical > HORIZONTAL_THRESHOLD_DEG:
+                    continue
+                valid_contours.append(cnt)
+
+        if valid_contours:
+            best = max(valid_contours, key=cv2.contourArea)
+            line_ok = True
+            heading_err, lat_err_px = self.extract_errors(best)
+
+            [vx, vy, x, y] = cv2.fitLine(best, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx, vy = float(vx), float(vy)
+            if vy > 0:
+                vx, vy = -vx, -vy
+            p1 = (int(x - vx * 1000), int(y - vy * 1000))
+            p2 = (int(x + vx * 1000), int(y + vy * 1000))
+            cv2.line(display, p1, p2, (0, 0, 255), 2)
+
+            M = cv2.moments(best)
+            if M['m00'] > 0:
+                cx_px = int(M['m10'] / M['m00'])
+                cy_px = int(M['m01'] / M['m00'])
+                cv2.circle(display, (cx_px, cy_px), 6, (0, 255, 255), -1)
+                cv2.line(display,
+                         (IMAGE_CENTER_X, cy_px), (cx_px, cy_px),
+                         (0, 255, 255), 2)
+
+        detections = []
+        if self.model:
+            results = self.model(frame, conf=self.confidence, verbose=False)
+            for r in results:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    if (y2 - y1) < MIN_BOX_HEIGHT_PX:
+                        continue
+
+                    label = str(r.names[int(box.cls[0])]).upper()
+                    conf = float(box.conf[0])
+                    dist_cm = self.floor_distance(float(y2))
+                    detections.append({'label': label, 'distance': dist_cm, 'conf': conf})
+
+                    cv2.rectangle(display, (x1, y1), (x2, y2), (255, 50, 50), 2)
+                    dist_txt = f"{dist_cm:.1f}cm" if dist_cm != math.inf else "far"
+                    cv2.putText(display,
+                                f"{label} {conf:.2f} | {dist_txt}",
+                                (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 50, 50), 2)
+
+        hud_col = (0, 255, 0) if line_ok else (0, 0, 255)
+        cv2.putText(display, f"H_err: {heading_err:+.2f} rad | L_err: {lat_err_px:+.1f} px",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(display,
+                    f"line: {'YES' if line_ok else 'NO / HORIZONTAL IGNORED'}",
+                    (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_col, 1)
+
+        return display, green_mask, line_ok, heading_err, lat_err_px, detections
+
+
+# ============================================================
+#  MAIN ROS2 NODE
+# ============================================================
+
+class VisionSlamNode(Node):
+
+    def __init__(self):
+        super().__init__('vision_slam_node')
+
+        self._vis_lock = threading.Lock()
+        self.bridge = CvBridge()
+        self.vision = VisionProcessor(YOLO_MODEL_PATH, YOLO_CONFIDENCE)
+
+        cam_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=QOS_DEPTH,
+        )
+        self.image_sub = self.create_subscription(
+            Image, CAMERA_TOPIC, self._image_cb, qos_profile=cam_qos)
+
+        self._odom_subs = []
+        self.active_odom_topic = None
+        for topic in ODOM_TOPIC_CANDIDATES:
+            sub = self.create_subscription(
+                Odometry, topic,
+                self._make_odom_cb(topic),
+                qos_profile=qos_profile_sensor_data)
+            self._odom_subs.append(sub)
+
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', PUBLISHER_QUEUE_SIZE)
+
+        self.odom_ok = False
+        self.init_x = self.init_y = 0.0
+        self.init_yaw = 0.0
+        self.robot_x = self.robot_y = 0.0
+        self.robot_yaw = 0.0
+
+        self._line_ok = False
+        self._heading_err = 0.0
+        self._lat_err_px = 0.0
+        self._detections = []
+
+        self.nav_state = "FOLLOW_LINE"
+        self.active_priority = IDLE_PRIORITY
+        self.state_entry_time = 0.0
+        self.target_yaw = 0.0
+        self.cooldown_until = 0.0
+
+        # Delayed turn state tracking
+        self.pending_turn_rad = 0.0
+        self.pending_turn_priority = 0
+        self.target_travel_dist = 0.0
+        self.action_start_x = 0.0
+        self.action_start_y = 0.0
+        self.search_entry_yaw = 0.0
+
+        # PID Memory Variables
+        self.integral_heading = 0.0
+        self.integral_lateral = 0.0
+        self.prev_heading_err = 0.0
+        self.prev_lat_err_px = 0.0
+        self.last_pid_time = 0.0
+
+        self._action_dispatch = {
+            "STOP": self._on_stop,
+            "FORWARD": self._on_forward,
+            "RIGHT": self._on_right,
+            "LEFT": self._on_left,
+            "NO ENTRY": self._on_dead_end,
+            "DEAD END": self._on_dead_end,
+        }
+        self._state_dispatch = {
+            "FOLLOW_LINE": self._tick_follow_line,
+            "APPROACHING": self._tick_approaching,
+            "STOPPING": self._tick_stopping,
+            "TURNING": self._tick_turning,
+            "SEARCHING": self._tick_searching,
+        }
+
+        self.control_timer = self.create_timer(CONTROL_LOOP_PERIOD, self._control_loop)
+        self.get_logger().info("VisionSlamNode ready.")
+
+    def _reset_pid(self):
+        """Clear memory to prevent stale integrals/derivatives after turning/stopping"""
+        self.integral_heading = 0.0
+        self.integral_lateral = 0.0
+        self.prev_heading_err = 0.0
+        self.prev_lat_err_px = 0.0
+        self.last_pid_time = 0.0
+
+    def _make_odom_cb(self, topic: str):
+        def cb(msg):
+            if self.active_odom_topic is None:
+                self.active_odom_topic = topic
+                self.get_logger().info(f"Odometry latched → {topic}")
+            if topic != self.active_odom_topic:
+                return
+            px = msg.pose.pose.position.x
+            py = msg.pose.pose.position.y
+            q = msg.pose.pose.orientation
+            raw_yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+            )
+            if not self.odom_ok:
+                self.init_x, self.init_y, self.init_yaw = px, py, raw_yaw
+                self.odom_ok = True
+            dx, dy = px - self.init_x, py - self.init_y
+            c, s = math.cos(-self.init_yaw), math.sin(-self.init_yaw)
+            self.robot_x = dx * c - dy * s
+            self.robot_y = dx * s + dy * c
+            self.robot_yaw = math.atan2(
+                math.sin(raw_yaw - self.init_yaw),
+                math.cos(raw_yaw - self.init_yaw),
+            )
+
+        return cb
+
+    def _image_cb(self, ros_img):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(ros_img, desired_encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().error(f"cv_bridge: {exc}")
+            return
+
+        display, mask, line_ok, h_err, l_err, dets = self.vision.process_frame(frame)
+
+        with self._vis_lock:
+            self._line_ok = line_ok
+            self._heading_err = h_err
+            self._lat_err_px = l_err
+            self._detections = dets
+
+        cv2.imshow("Green Mask (full frame)", mask)
+        cv2.imshow("Vision + YOLO", display)
+        cv2.waitKey(1)
+
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _yaw_diff(self, target: float, current: float) -> float:
+        return math.atan2(
+            math.sin(target - current),
+            math.cos(target - current),
+        )
+
+    def _enter_state(self, state: str, priority: int = IDLE_PRIORITY):
+        if state == "FOLLOW_LINE":
+            self._reset_pid()
+
+        self.nav_state = state
+        self.active_priority = priority
+        self.state_entry_time = self._now()
+        self.get_logger().info(f"  → State: {state}  (priority {priority})")
+
+    def _schedule_turn(self, offset_rad: float, priority: int, dist_cm: float):
+        self.pending_turn_rad = offset_rad
+        self.pending_turn_priority = priority
+        self.target_travel_dist = (dist_cm / 100.0) * TURN_DISTANCE_MULTIPLIER
+        self.action_start_x = self.robot_x
+        self.action_start_y = self.robot_y
+        self._enter_state("APPROACHING", priority)
+
+    def _command_turn(self, offset_rad: float, priority: int):
+        self.target_yaw = math.atan2(
+            math.sin(self.robot_yaw + offset_rad),
+            math.cos(self.robot_yaw + offset_rad),
+        )
+        self._enter_state("TURNING", priority)
+
+    def _on_stop(self, _t, _dist_cm):
+        self._enter_state("STOPPING", ACTION_PRIORITY["STOP"])
+
+    def _on_forward(self, _t, _dist_cm):
+        if self.nav_state != "FOLLOW_LINE":
+            self._enter_state("FOLLOW_LINE", ACTION_PRIORITY["FORWARD"])
+
+    def _on_right(self, _t, dist_cm):
+        self._schedule_turn(-math.pi / 2, ACTION_PRIORITY["RIGHT"], dist_cm)
+
+    def _on_left(self, _t, dist_cm):
+        self._schedule_turn(math.pi / 2, ACTION_PRIORITY["LEFT"], dist_cm)
+
+    def _on_dead_end(self, _t, _dist_cm):
+        self.search_entry_yaw = self.robot_yaw
+        self._enter_state("SEARCHING", ACTION_PRIORITY["FORWARD"])
+
+    def _tick_follow_line(self, twist: Twist, t: float,
+                          line_ok: bool, heading_err: float, lat_err_px: float):
+        if not line_ok:
+            self._reset_pid()  # Prevent spooling up memory while blind
+            return
+
+        # Time delta calculation for I and D terms
+        if self.last_pid_time == 0.0:
+            self.last_pid_time = t
+            dt = CONTROL_LOOP_PERIOD
+        else:
+            dt = t - self.last_pid_time
+            if dt <= 0.0:
+                dt = CONTROL_LOOP_PERIOD
+        self.last_pid_time = t
+
+        # Speed braking Failsafe
+        speed_multiplier = 1.0
+        if abs(lat_err_px) > SEVERE_LATERAL_OFFSET:
+            speed_multiplier = 0.5
+
+        # === HEADING PID ===
+        self.integral_heading += heading_err * dt
+        self.integral_heading = max(-MAX_INTEGRAL_WINDUP, min(MAX_INTEGRAL_WINDUP, self.integral_heading))
+        derivative_heading = (heading_err - self.prev_heading_err) / dt
+
+        pid_heading = (KP_HEADING * heading_err) + (KI_HEADING * self.integral_heading) + (
+                    KD_HEADING * derivative_heading)
+
+        # === LATERAL PID ===
+        self.integral_lateral += lat_err_px * dt
+        self.integral_lateral = max(-MAX_INTEGRAL_WINDUP, min(MAX_INTEGRAL_WINDUP, self.integral_lateral))
+        derivative_lateral = (lat_err_px - self.prev_lat_err_px) / dt
+
+        pid_lateral = (KP_LATERAL * lat_err_px) + (KI_LATERAL * self.integral_lateral) + (
+                    KD_LATERAL * derivative_lateral)
+
+        # Save states for next loop
+        self.prev_heading_err = heading_err
+        self.prev_lat_err_px = lat_err_px
+
+        # Combine, applying negative polarity to correct towards zero
+        yaw_cmd = -pid_heading - pid_lateral
+        yaw_cmd = max(-MAX_ANGULAR_CORRECTION, min(MAX_ANGULAR_CORRECTION, yaw_cmd))
+
+        if abs(heading_err) <= MAX_HEADING_TO_DRIVE:
+            twist.linear.x = FORWARD_SPEED * speed_multiplier
+            twist.angular.z = yaw_cmd
+        else:
+            twist.angular.z = yaw_cmd
+
+    def _tick_approaching(self, twist: Twist, t: float,
+                          line_ok: bool, heading_err: float, lat_err_px: float):
+        traveled = math.hypot(self.robot_x - self.action_start_x, self.robot_y - self.action_start_y)
+
+        if traveled >= self.target_travel_dist:
+            self.get_logger().info(f"Approach complete ({traveled:.2f}m) — executing turn.")
+            self._command_turn(self.pending_turn_rad, self.pending_turn_priority)
+            return
+
+        self._tick_follow_line(twist, t, line_ok, heading_err, lat_err_px)
+
+    def _tick_stopping(self, twist: Twist, t: float,
+                       line_ok: bool, heading_err: float, lat_err_px: float):
+        if t - self.state_entry_time >= STOP_DURATION_SEC:
+            self.get_logger().info("STOP complete — resuming.")
+            self._enter_state("FOLLOW_LINE")
+
+    def _tick_turning(self, twist: Twist, t: float,
+                      line_ok: bool, heading_err: float, lat_err_px: float):
+        diff = self._yaw_diff(self.target_yaw, self.robot_yaw)
+        if abs(diff) < TURN_DONE_THRESH:
+            self.get_logger().info("Turn complete — resuming line follow.")
+            self._enter_state("FOLLOW_LINE")
+        else:
+            twist.angular.z = TURN_SPEED if diff > 0 else -TURN_SPEED
+
+    def _tick_searching(self, twist: Twist, t: float,
+                        line_ok: bool, heading_err: float, lat_err_px: float):
+        elapsed = t - self.state_entry_time
+
+        if line_ok and abs(heading_err) > SEARCH_PATH_ANGLE:
+            direction = math.pi / 2 if heading_err > 0 else -math.pi / 2
+            side = "LEFT" if heading_err > 0 else "RIGHT"
+            self.get_logger().info(
+                f"Alternate path found ({side}, err={heading_err:.2f} rad) — turning.")
+            self._command_turn(direction, ACTION_PRIORITY["DEAD END"])
+            return
+
+        if elapsed >= SEARCH_TIMEOUT_SEC:
+            self.get_logger().info("Search timeout — Exact 180° retreat from original heading.")
+            escape_yaw = math.atan2(
+                math.sin(self.search_entry_yaw + math.pi),
+                math.cos(self.search_entry_yaw + math.pi),
+            )
+            self.target_yaw = escape_yaw
+            self._enter_state("TURNING", ACTION_PRIORITY["DEAD END"])
+            return
+
+        twist.angular.z = (SEARCH_TURN_SPEED
+                           if elapsed < SEARCH_TIMEOUT_SEC / 2.0
+                           else -SEARCH_TURN_SPEED)
+
+    def _process_detections(self, t: float, detections: list):
+        valid_bypasses = ["LEFT", "RIGHT", "FORWARD"]
+        if t <= self.cooldown_until:
+            if not (self.nav_state == "SEARCHING" and any(d['label'] in valid_bypasses for d in detections)):
+                return
+
+        best_label = None
+        best_priority = -1
+        best_dist = math.inf
+
+        for det in detections:
+            label = det['label']
+            is_escape_sign = (self.nav_state == "SEARCHING" and label in valid_bypasses)
+            max_dist = math.inf if is_escape_sign else ACTION_DISTANCE_CM
+
+            if det['distance'] > max_dist:
+                continue
+
+            priority = ACTION_PRIORITY.get(label, 0)
+
+            if t <= self.cooldown_until and not is_escape_sign:
+                continue
+
+            if priority < self.active_priority:
+                continue
+
+            if (priority > best_priority or
+                    (priority == best_priority and det['distance'] < best_dist)):
+                best_label = label
+                best_priority = priority
+                best_dist = det['distance']
+
+        if best_label and best_label in self._action_dispatch:
+            self.get_logger().info(
+                f"Sign accepted → {best_label}  "
+                f"dist={best_dist:.1f}cm  priority={best_priority}")
+            self.cooldown_until = t + SIGN_COOLDOWN_SEC
+            self._action_dispatch[best_label](t, best_dist)
+
+    def _control_loop(self):
+        twist = Twist()
+        t = self._now()
+
+        if not self.odom_ok:
+            self.cmd_pub.publish(twist)
+            return
+
+        with self._vis_lock:
+            line_ok = self._line_ok
+            h_err = self._heading_err
+            l_err = self._lat_err_px
+            dets = list(self._detections)
+
+        self._process_detections(t, dets)
+
+        handler = self._state_dispatch.get(self.nav_state)
+        if handler:
+            handler(twist, t, line_ok, h_err, l_err)
+
+        self.cmd_pub.publish(twist)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisionSlamNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Keyboard interrupt — shutting down.")
+    finally:
+        node.cmd_pub.publish(Twist())
+        node.destroy_node()
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
