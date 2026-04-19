@@ -9,16 +9,16 @@ from ultralytics import YOLO
 # --- PHYSICAL CONSTANTS ---
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
-CAMERA_HEIGHT_CM = 18.5  # Height of lens from floor
-CAMERA_TILT_DEG = 35.0  # Downward tilt from horizontal
+CAMERA_HEIGHT_CM = 20  # Height of lens from floor
+CAMERA_TILT_DEG = 36.0  # Downward tilt from horizontal
 V_FOV = 48.0  # Vertical Field of View of your webcam
 
 # --- FINE TUNING ---
-DISTANCE_CORRECTION_FACTOR = 0.9
-DISTANCE_OFFSET = 0.0
+DISTANCE_CORRECTION_FACTOR = 1
+DISTANCE_OFFSET = -5
 
 MIN_BOX_HEIGHT_PX = 10
-YOLO_MODEL_PATH = "weights/best.pt"
+YOLO_MODEL_PATH = "/home/agilex/limo5_ws/src/cosc_4366el_a2_g5/cosc_4366el_a2_g5/best.pt"
 YOLO_CONFIDENCE = 0.5
 
 
