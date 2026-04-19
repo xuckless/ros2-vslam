@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['DEAD END', 'GO FORWARD', 'NO ENTRY', 'STOP', 'TURN LEFT', 'TURN RIGHT']
+
+roboflow:
+  workspace: syeds-workspace-csb5t
+  project: robotics-vision
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/syeds-workspace-csb5t/robotics-vision/dataset/3

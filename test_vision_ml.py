@@ -1,68 +1,152 @@
 #!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
 import cv2
+import time
 import math
 from ultralytics import YOLO
 
+# --- PHYSICAL CONSTANTS ---
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
-FLOOR_DIST_K = 5000.0
+CAMERA_HEIGHT_CM = 18.5  # Height of lens from floor
+CAMERA_TILT_DEG = 35.0  # Downward tilt from horizontal
+V_FOV = 48.0  # Vertical Field of View of your webcam
+
+# --- FINE TUNING ---
+DISTANCE_CORRECTION_FACTOR = 0.9
+DISTANCE_OFFSET = 0.0
+
 MIN_BOX_HEIGHT_PX = 10
-YOLO_MODEL_PATH = "best_yolo.pt"  # Change this to 'yolov8n.pt' to test without your custom weights
+YOLO_MODEL_PATH = "weights/best.pt"
 YOLO_CONFIDENCE = 0.5
 
 
-def floor_distance(box_bottom_y):
-    denom = IMAGE_HEIGHT - box_bottom_y
-    if denom < 1:
+def estimate_distance_geometry(y_pixel):
+    relative_y = ((IMAGE_HEIGHT / 2) - y_pixel) / (IMAGE_HEIGHT / 2)
+    pixel_angle_offset = relative_y * (V_FOV / 2)
+    total_angle_deg = (90 - CAMERA_TILT_DEG) + pixel_angle_offset
+
+    if total_angle_deg >= 89:
         return math.inf
-    return FLOOR_DIST_K / denom
+
+    raw_distance = CAMERA_HEIGHT_CM * math.tan(math.radians(total_angle_deg))
+    corrected_distance = (raw_distance * DISTANCE_CORRECTION_FACTOR) + DISTANCE_OFFSET
+
+    return max(0, corrected_distance)
 
 
-def main():
-    try:
-        model = YOLO(YOLO_MODEL_PATH)
-        print("YOLO model loaded.")
-    except Exception as exc:
-        print(f"YOLO load error: {exc}")
-        return
+class LimoVisionNode(Node):
+    def __init__(self):
+        super().__init__('limo_vision_node')
 
-    cap = cv2.VideoCapture(0)
+        try:
+            self.model = YOLO(YOLO_MODEL_PATH)
+            self.get_logger().info("YOLO model loaded.")
+        except Exception as exc:
+            self.get_logger().error(f"YOLO load error: {exc}")
+            raise exc
 
-    while True:
-        ret, frame = cap.read()
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
+
+        if not self.cap.isOpened():
+            self.get_logger().error("Failed to open OpenCV camera 0.")
+
+        self.prev_time = 0
+        self.timer = self.create_timer(0.033, self.timer_callback)
+
+    def timer_callback(self):
+        ret, frame = self.cap.read()
         if not ret:
-            break
+            return
 
+        curr_time = time.time()
+        fps = 1 / (curr_time - self.prev_time) if (curr_time - self.prev_time) > 0 else 0
+        self.prev_time = curr_time
+
+        # Ensure correct size for consistent distance calculations
         frame = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT))
         display = frame.copy()
 
-        results = model(frame, conf=YOLO_CONFIDENCE, verbose=False)
+        results = self.model(frame, conf=YOLO_CONFIDENCE, verbose=False)
+        result = results[0]
 
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                if (y2 - y1) < MIN_BOX_HEIGHT_PX:
+        # --- CUSTOM STRICT FILTERING ---
+        if len(result.boxes) > 0:
+            keep_indices = []
+            boxes = result.boxes.xyxy
+
+            img_h, img_w = result.orig_shape
+            max_allowed_area = 0.20 * (img_w * img_h)
+
+            for i in range(len(boxes)):
+                box_a = boxes[i]
+
+                # 1. Check if box is egregiously big
+                box_area = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+                if box_area > max_allowed_area:
                     continue
 
-                label = str(r.names[int(box.cls[0])]).upper()
-                conf = float(box.conf[0])
-                dist_cm = floor_distance(float(y2))
+                    # 2. Check for encapsulation
+                is_encapsulating = False
+                for j in range(len(boxes)):
+                    if i == j:
+                        continue
+                    box_b = boxes[j]
 
-                cv2.rectangle(display, (x1, y1), (x2, y2), (255, 50, 50), 2)
+                    if (box_a[0] <= box_b[0] and box_a[1] <= box_b[1] and
+                            box_a[2] >= box_b[2] and box_a[3] >= box_b[3]):
+                        is_encapsulating = True
+                        break
 
-                dist_txt = f"{dist_cm:.1f}cm" if dist_cm != math.inf else "far"
-                cv2.putText(display, f"{label} {conf:.2f} | {dist_txt}",
-                            (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 50, 50), 2)
+                if not is_encapsulating:
+                    keep_indices.append(i)
 
-                print(f"Detected: {label} | Distance: {dist_txt}")
+            result.boxes = result.boxes[keep_indices]
+        # -----------------------------------------------------------
 
-        cv2.imshow("ML Decision & Distance Test", display)
+        # Draw retained boxes and calculate geometry-based distance
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            if (y2 - y1) < MIN_BOX_HEIGHT_PX:
+                continue
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            label = str(result.names[int(box.cls[0])]).upper()
+            conf = float(box.conf[0])
 
-    cap.release()
-    cv2.destroyAllWindows()
+            dist_cm = estimate_distance_geometry(float(y2))
+
+            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 50, 50), 2)
+            dist_txt = f"{dist_cm:.1f}cm" if dist_cm != math.inf else "Too Far"
+            cv2.putText(display, f"{label} {conf:.2f} | {dist_txt}",
+                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 50, 50), 2)
+
+            self.get_logger().info(f"Detected: {label} | Bottom Pixel: {y2} | Distance: {dist_txt}")
+
+        cv2.putText(display, f"FPS: {int(fps)}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow("LIMO ML & Geometry Distance", display)
+        cv2.waitKey(1)
+
+    def destroy_node(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LimoVisionNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

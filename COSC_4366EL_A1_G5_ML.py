@@ -1,82 +1,109 @@
+#!/usr/bin/env python3
 import cv2
 import time
+import math
 from ultralytics import YOLO
 
 """
 Credits: Syed Ali; Roboflow; Gemini
 """
 
+# --- PHYSICAL CONSTANTS ---
+IMAGE_HEIGHT = 480
+CAMERA_HEIGHT_CM = 18.5  # Height of lens from floor
+CAMERA_TILT_DEG = 35.0  # Downward tilt from horizontal
+V_FOV = 48.0  # Vertical Field of View of your webcam
+
+# --- FINE TUNING ---
+DISTANCE_CORRECTION_FACTOR = .9  # Multiplier (e.g., 0.9 for 10% less)
+DISTANCE_OFFSET = 0.0  # Constant addition/subtraction in cm
+
+
+def estimate_distance_geometry(y_pixel):
+    """
+    Calculates distance. Inverting the relative_y ensures that
+    higher pixel values (bottom of screen) result in shorter distances.
+    """
+    # Inverted: Bottom of screen (y=480) becomes -1, center 0, top 1
+    # This aligns the pixel coordinate system with the downward tilt
+    relative_y = ((IMAGE_HEIGHT / 2) - y_pixel) / (IMAGE_HEIGHT / 2)
+
+    # Angle of the specific pixel relative to the camera optical axis
+    pixel_angle_offset = relative_y * (V_FOV / 2)
+
+    # Calculate angle relative to the floor
+    # As pixel_angle_offset becomes more negative (bottom of screen),
+    # the total angle decreases, bringing the distance closer.
+    total_angle_deg = (90 - CAMERA_TILT_DEG) + pixel_angle_offset
+
+    # Prevent tangent of 90 or negative angles
+    if total_angle_deg >= 89:
+        return math.inf
+
+    raw_distance = CAMERA_HEIGHT_CM * math.tan(math.radians(total_angle_deg))
+
+    # Apply fine-tuning
+    corrected_distance = (raw_distance * DISTANCE_CORRECTION_FACTOR) + DISTANCE_OFFSET
+
+    return max(0, corrected_distance)
+
 
 def trackSign_ML(frame, model):
-    """
-    Detects visual signs using a trained YOLO model and overlays bounding boxes,
-    labels, confidence, and estimated distance.
-    """
     results = model(frame, conf=0.5, verbose=False)
 
     for r in results:
         for box in r.boxes:
-            # Extract bounding box coordinates
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # Extract class ID, label name, and confidence score
-            cls_id = int(box.cls[0])
-            label = r.names[cls_id]
+            if (y2 - y1) < 10:
+                continue
+
+            label = r.names[int(box.cls[0])]
             conf = float(box.conf[0])
 
-            # Distance Estimation (Heuristic based on bounding box height)
-            box_height = y2 - y1
-            estimated_distance_cm = (800 / box_height) if box_height > 0 else 0
+            # Calculate distance
+            dist_cm = estimate_distance_geometry(float(y2))
 
-            # Draw bounding box
+            # Visuals
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 50, 50), 2)
 
-            # Overlay label, confidence, and distance
-            info_text = f"{label} {conf:.2f} | Dist: {estimated_distance_cm:.1f}cm"
+            dist_txt = f"{dist_cm:.1f}cm" if dist_cm != math.inf else "Too Far"
+            info_text = f"{label.upper()} {conf:.2f} | {dist_txt}"
             cv2.putText(frame, info_text, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 50, 50), 2)
+
+            # Debugging print
+            print(f"Bottom Pixel: {y2} | Distance: {dist_txt}")
 
     return frame
 
 
 def main():
-    # Load the trained YOLO model
     try:
-        model = YOLO("best_yolo.pt")
+        model = YOLO("weights/best.pt")
     except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Please ensure your trained 'best_yolo.pt' file is in the same directory.")
+        print(f"Error: {e}")
         return
 
-    # Initialize Camera (Targeting 640x480 for >= 10-15 FPS)
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
 
     prev_time = 0
-
-    print("YOLO ML Detection. Press 'q' to quit.")
-
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame.")
             break
 
-        # Calculate FPS
         curr_time = time.time()
         fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
         prev_time = curr_time
 
-        # Process frame
         processed_frame = trackSign_ML(frame, model)
 
-        # Draw FPS counter
         cv2.putText(processed_frame, f"FPS: {int(fps)}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        # Display output
-        cv2.imshow("Visual Sign Detection (ML)", processed_frame)
+        cv2.imshow("Sign Detection (Fixed Inversion)", processed_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
