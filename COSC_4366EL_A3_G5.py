@@ -109,9 +109,8 @@ STOP_DURATION_SEC = 3.0
 SEARCH_TURN_SPEED = 0.20
 SEARCH_TIMEOUT_SEC = 4.0
 SEARCH_PATH_ANGLE = 0.40    # rad — heading deviation that signals an alternate path
-TURN_DONE_THRESH = 0.08     # rad — yaw error threshold for TURNING_FIXED completion
-DYNAMIC_TURN_LATERAL_THRESH = 30   # px — lateral offset to call a dynamic turn done
-DYNAMIC_TURN_MIN_DURATION = 0.5    # s  — minimum turn time before alignment is checked
+TURN_DONE_THRESH = 0.08         # rad — yaw error threshold for TURNING_FIXED completion
+DYNAMIC_TURN_MIN_ANGLE_DEG = 35.0  # deg — minimum odom turn before line-latch is allowed
 SIGN_COOLDOWN_SEC = 5.0
 TURN_DISTANCE_MULTIPLIER = 1.2
 
@@ -520,6 +519,7 @@ class VisionSlamNode(Node):
         self.action_start_x         = 0.0
         self.action_start_y         = 0.0
         self.search_entry_yaw       = 0.0
+        self.turn_entry_yaw         = 0.0  # odom yaw snapshot at turn start
 
         # ── PID state (single lateral channel + EMA) ─────────────────
         self.integral     = 0.0
@@ -683,8 +683,9 @@ class VisionSlamNode(Node):
         self._enter_state("APPROACHING", priority)
 
     def _command_dynamic_turn(self, direction: str, priority: int) -> None:
-        """Begin a dynamic turn; exits when the line is re-acquired."""
+        """Begin a dynamic turn; exits when min angle turned AND line re-acquired."""
         self.pending_turn_direction = direction
+        self.turn_entry_yaw         = self.robot_yaw   # odom snapshot for angle guard
         self._enter_state("TURNING_DYNAMIC", priority)
 
     # ================================================================
@@ -756,22 +757,29 @@ class VisionSlamNode(Node):
     def _tick_turning_dynamic(self, twist: Twist, t: float,
                               line_ok: bool, heading_err: float, lat_err_px: float):
         """
-        Turns in the commanded direction until:
-          • The line is visible again (line_ok), AND
-          • The lateral offset is within DYNAMIC_TURN_LATERAL_THRESH, AND
-          • At least DYNAMIC_TURN_MIN_DURATION seconds have elapsed
-            (prevents premature exit before the robot has actually turned).
-        """
-        elapsed = t - self.state_entry_time
-        if (line_ok
-                and elapsed >= DYNAMIC_TURN_MIN_DURATION
-                and abs(lat_err_px) < DYNAMIC_TURN_LATERAL_THRESH):
-            self.get_logger().info(
-                f"Dynamic turn aligned — l_err={lat_err_px:.1f}px, "
-                f"elapsed={elapsed:.2f}s")
-            self._enter_state("FOLLOW_LINE")
-            return
+        Bang-bang turn in the commanded direction.
 
+        Exit condition (both must be true simultaneously):
+          1. Odometry confirms >= DYNAMIC_TURN_MIN_ANGLE_DEG has been turned
+             — prevents the line follower latching onto the *original* path
+             before the robot has meaningfully rotated.
+          2. The line follower detects a valid (non-horizontal) line.
+
+        As soon as both are true, angular.z is left at zero (twist is not
+        written before returning) and FOLLOW_LINE takes over — the two
+        states cannot overlap.
+        """
+        angle_turned = abs(self._yaw_diff(self.robot_yaw, self.turn_entry_yaw))
+        min_angle_rad = math.radians(DYNAMIC_TURN_MIN_ANGLE_DEG)
+
+        if angle_turned >= min_angle_rad and line_ok:
+            self.get_logger().info(
+                f"Dynamic turn done — turned {math.degrees(angle_turned):.1f}°, "
+                f"line latched (l_err={lat_err_px:.1f}px)")
+            self._enter_state("FOLLOW_LINE")
+            return   # twist.angular.z stays 0 — clean handover, no overlap
+
+        # Minimum angle not yet met, or line not yet seen — keep turning
         twist.angular.z = (TURN_SPEED
                            if self.pending_turn_direction == "LEFT"
                            else -TURN_SPEED)
