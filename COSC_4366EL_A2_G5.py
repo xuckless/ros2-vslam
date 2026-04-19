@@ -56,9 +56,20 @@ CAMERA_LOOP_HZ = 30
 CAMERA_LOOP_PERIOD = 1.0 / CAMERA_LOOP_HZ
 
 # -- ROI trapezoid (bottom-focused, matches tested tuning) --
-ROI_VERTICES = np.array(
-    [[(200, 480), (280, 200), (360, 200), (440, 480)]], dtype=np.int32
-)
+# ROI_SCALE: multiplier applied to the base trapezoid shape.
+# 1.0 = original (bottom 200-440, top 280-360, top-y 200).
+# Increase to widen/raise the ROI, decrease to narrow/lower it.
+ROI_SCALE = 1.0
+_roi_bx_half  = int(120 * ROI_SCALE)   # half-width at bottom from centre (base=120)
+_roi_tx_half  = int( 40 * ROI_SCALE)   # half-width at top    from centre (base=40)
+_roi_top_y    = int(480 - (280 * ROI_SCALE))  # top edge y (base height=280px → top at y=200)
+_roi_top_y    = max(0, _roi_top_y)     # clamp so it never goes off-screen
+ROI_VERTICES = np.array([[
+    (IMAGE_CENTER_X - _roi_bx_half, 480),
+    (IMAGE_CENTER_X - _roi_tx_half, _roi_top_y),
+    (IMAGE_CENTER_X + _roi_tx_half, _roi_top_y),
+    (IMAGE_CENTER_X + _roi_bx_half, 480),
+]], dtype=np.int32)
 
 # -- HSV Green Tape -----------------------------------------
 HSV_LOWER_GREEN = np.array([35, 40, 40])
@@ -75,7 +86,8 @@ CAMERA_TILT_DEG = 36.0
 V_FOV = 48.0
 DISTANCE_CORRECTION_FACTOR = 1.0
 DISTANCE_OFFSET = -5.0
-ACTION_DISTANCE_CM = 25.0   # Signs beyond this are ignored
+ACTION_DISTANCE_CM = 25.0        # Signs beyond this are ignored
+NO_ENTRY_MIN_DISTANCE_CM = 15.0  # NO ENTRY ignored below this — prevents close-range misclassification
 MIN_BOX_HEIGHT_PX = 10
 
 # -- YOLO ---------------------------------------------------
@@ -89,7 +101,7 @@ MAX_BOX_AREA_RATIO = 0.20   # Boxes > 20% of frame area are rejected as noise
 # -- Temporal filtering ("Don't Blink" rule) ----------------
 # A sign is only acted on if seen in >= DETECTION_MIN_COUNT
 # of the last DETECTION_WINDOW_SIZE control-loop ticks (10 Hz).
-TEMPORAL_FILTER_ENABLED = False  # Set False to disable and react on single frame
+TEMPORAL_FILTER_ENABLED = False  # Set True to require N detections in M ticks before acting
 DETECTION_WINDOW_SIZE   = 5     # M — rolling window length
 DETECTION_MIN_COUNT     = 3     # N — minimum hits required to confirm
 
@@ -112,6 +124,11 @@ MAX_WINDUP = 1.0            # Integral anti-windup clamp
 
 SEVERE_LATERAL_OFFSET = 60  # px — speed halved above this to aid recovery
 
+# -- Lost-line wiggle ("look around" before giving up) ------
+LOST_LINE_WIGGLE_ANGLE_DEG  = 45.0  # degrees swept each side (right then left)
+LOST_LINE_WIGGLE_SPEED      = 0.20  # rad/s rotation speed during wiggle
+LOST_LINE_CENTER_THRESH_DEG = 3.0   # degrees tolerance to call "back at neutral"
+
 # -- State Machine Timing -----------------------------------
 STOP_DURATION_SEC = 3.0
 SEARCH_TURN_SPEED = 0.20
@@ -120,16 +137,20 @@ SEARCH_PATH_ANGLE = 0.40    # rad — heading deviation that signals an alternat
 TURN_DONE_THRESH = 0.08         # rad — yaw error threshold for TURNING_FIXED completion
 DYNAMIC_TURN_MIN_ANGLE_DEG = 35.0  # deg — minimum odom turn before line-latch is allowed
 SIGN_COOLDOWN_SEC = 5.0
-TURN_DISTANCE_MULTIPLIER = 1.2
+TURN_DISTANCE_MULTIPLIER = 1.2  # Robot drives dist_cm * multiplier before turning
 
 # -- Action Priority ----------------------------------------
+# Labels exactly as output by the YOLO model (uppercased in VisionProcessor)
+TURN_LABELS = {"TURN LEFT", "TURN RIGHT"}   # turn signs fire at first detection, not at 25cm cap
+
 ACTION_PRIORITY = {
-    "NO ENTRY": 4,
-    "DEAD END": 4,
-    "STOP": 3,
-    "RIGHT": 2,
-    "LEFT": 2,
-    "FORWARD": 1,
+    "NO ENTRY":   4,
+    "DEAD END":   4,
+    "STOP":       3,
+    "TURN RIGHT": 2,
+    "TURN LEFT":  2,
+    "FORWARD":    1,
+    "GO FORWARD": 1,   # model outputs "GO FORWARD", not "FORWARD"
 }
 IDLE_PRIORITY = 0
 
@@ -530,19 +551,26 @@ class VisionSlamNode(Node):
         self.cooldown_until   = 0.0
 
         # Pending turn
-        self.pending_turn_direction = ""  # "LEFT" or "RIGHT"
-        self.pending_turn_priority  = 0
-        self.target_travel_dist     = 0.0
-        self.action_start_x         = 0.0
-        self.action_start_y         = 0.0
-        self.search_entry_yaw       = 0.0
-        self.turn_entry_yaw         = 0.0  # odom yaw snapshot at turn start
+        self.pending_turn_direction  = ""   # "LEFT" or "RIGHT"
+        self.pending_turn_priority   = 0
+        self.target_travel_dist      = 0.0
+        self.action_start_x          = 0.0
+        self.action_start_y          = 0.0
+        self.search_entry_yaw        = 0.0
+        self.turn_entry_yaw          = 0.0  # odom yaw snapshot at turn start
+        self.inevitable_turn_pending = False  # True while a turn is scheduled but not yet executed
 
         # ── PID state (single lateral channel + EMA) ─────────────────
         self.integral     = 0.0
         self.prev_error   = 0.0
         self.smooth_error = 0.0
         self.last_pid_time = 0.0
+
+        # ── Lost-line wiggle state ────────────────────────────────────
+        # Phases: 0=idle  1=turn RIGHT  2=return centre  3=turn LEFT
+        #         4=return centre  5=give up (stop)
+        self._wiggle_phase      = 0
+        self._wiggle_origin_yaw = 0.0
 
         # ── VSLAM ───────────────────────────────────────────────────
         self.last_map_update = 0.0
@@ -556,12 +584,13 @@ class VisionSlamNode(Node):
 
         # ── Dispatch tables ──────────────────────────────────────────
         self._action_dispatch = {
-            "STOP":     self._on_stop,
-            "FORWARD":  self._on_forward,
-            "RIGHT":    self._on_right,
-            "LEFT":     self._on_left,
-            "NO ENTRY": self._on_dead_end,
-            "DEAD END": self._on_dead_end,
+            "STOP":        self._on_stop,
+            "FORWARD":     self._on_forward,
+            "GO FORWARD":  self._on_forward,
+            "TURN RIGHT":  self._on_right,
+            "TURN LEFT":   self._on_left,
+            "NO ENTRY":    self._on_dead_end,
+            "DEAD END":    self._on_dead_end,
         }
         self._state_dispatch = {
             "FOLLOW_LINE":     self._tick_follow_line,
@@ -684,10 +713,10 @@ class VisionSlamNode(Node):
             self._enter_state("FOLLOW_LINE", ACTION_PRIORITY["FORWARD"])
 
     def _on_right(self, _t, dist_cm):
-        self._schedule_turn("RIGHT", ACTION_PRIORITY["RIGHT"], dist_cm)
+        self._schedule_turn("RIGHT", ACTION_PRIORITY["TURN RIGHT"], dist_cm)
 
     def _on_left(self, _t, dist_cm):
-        self._schedule_turn("LEFT", ACTION_PRIORITY["LEFT"], dist_cm)
+        self._schedule_turn("LEFT", ACTION_PRIORITY["TURN LEFT"], dist_cm)
 
     def _on_dead_end(self, _t, _dist_cm):
         self.search_entry_yaw = self.robot_yaw
@@ -698,18 +727,24 @@ class VisionSlamNode(Node):
     # ================================================================
 
     def _schedule_turn(self, direction: str, priority: int, dist_cm: float) -> None:
-        """Continue line-following until dist_cm travelled, then turn."""
-        self.pending_turn_direction = direction
-        self.pending_turn_priority  = priority
-        self.target_travel_dist     = (dist_cm / 100.0) * TURN_DISTANCE_MULTIPLIER
-        self.action_start_x         = self.robot_x
-        self.action_start_y         = self.robot_y
+        """Drive dist_cm * TURN_DISTANCE_MULTIPLIER to the turn point, then turn.
+        Marks the turn as inevitable — a STOP encountered en-route will not cancel it."""
+        self.pending_turn_direction  = direction
+        self.pending_turn_priority   = priority
+        self.target_travel_dist      = (dist_cm / 100.0) * TURN_DISTANCE_MULTIPLIER
+        self.action_start_x          = self.robot_x
+        self.action_start_y          = self.robot_y
+        self.inevitable_turn_pending = True
+        self.get_logger().info(
+            f"Turn scheduled: {direction} | detected={dist_cm:.1f}cm "
+            f"→ approach={self.target_travel_dist*100:.1f}cm (x{TURN_DISTANCE_MULTIPLIER})")
         self._enter_state("APPROACHING", priority)
 
     def _command_dynamic_turn(self, direction: str, priority: int) -> None:
         """Begin a dynamic turn; exits when min angle turned AND line re-acquired."""
-        self.pending_turn_direction = direction
-        self.turn_entry_yaw         = self.robot_yaw   # odom snapshot for angle guard
+        self.pending_turn_direction  = direction
+        self.turn_entry_yaw          = self.robot_yaw
+        self.inevitable_turn_pending = False   # turn is now executing — no longer pending
         self._enter_state("TURNING_DYNAMIC", priority)
 
     # ================================================================
@@ -719,12 +754,24 @@ class VisionSlamNode(Node):
     def _tick_follow_line(self, twist: Twist, t: float,
                           line_ok: bool, heading_err: float, lat_err_px: float):
         """
-        EMA-smoothed centroid lateral PID from LimoPathFollower.
-        heading_err is available in the signature but intentionally unused.
+        EMA-smoothed centroid lateral PID.
+        When the line disappears, runs a 5-phase odometry wiggle (right → centre →
+        left → centre → stop) to find any adjacent line the ROI missed before
+        giving up entirely.
         """
         if not line_ok:
+            # Reset PID exactly once on the first lost frame (phase 0→1 transition)
+            if self._wiggle_phase == 0:
+                self._reset_pid()
+            self._tick_wiggle(twist)
+            return
+
+        # Line (re-)acquired — cancel any active wiggle and resume PID fresh
+        if self._wiggle_phase != 0:
+            self.get_logger().info(
+                f"Line found during wiggle phase {self._wiggle_phase} — resuming PID.")
+            self._wiggle_phase = 0
             self._reset_pid()
-            return                  # safety stop — publish zero twist
 
         # Time delta
         if self.last_pid_time == 0.0:
@@ -755,6 +802,63 @@ class VisionSlamNode(Node):
         twist.angular.z = yaw_cmd
 
     # ------------------------------------------------------------------
+    def _tick_wiggle(self, twist: Twist) -> None:
+        """
+        Lost-line search wiggle — runs entirely inside FOLLOW_LINE, no new states.
+
+        Phase sequence (odometry-driven):
+          1 → rotate RIGHT  45°  from origin
+          2 → return to neutral  (0°)
+          3 → rotate LEFT   45°  from origin
+          4 → return to neutral  (0°)
+          5 → stop (give up — no adjacent line found)
+
+        At every phase, if the camera finds a line the caller (_tick_follow_line)
+        immediately cancels the wiggle and hands control back to PID.
+        """
+        wiggle_rad  = math.radians(LOST_LINE_WIGGLE_ANGLE_DEG)
+        centre_rad  = math.radians(LOST_LINE_CENTER_THRESH_DEG)
+
+        if self._wiggle_phase == 0:
+            # First lost frame — record origin yaw and begin phase 1
+            self._wiggle_origin_yaw = self.robot_yaw
+            self._wiggle_phase = 1
+            self.get_logger().info("Line lost — starting search wiggle (R→C→L→C→stop).")
+
+        diff = self._yaw_diff(self.robot_yaw, self._wiggle_origin_yaw)
+
+        if self._wiggle_phase == 1:                        # ── turn RIGHT ──
+            if diff <= -wiggle_rad:
+                self._wiggle_phase = 2
+                self.get_logger().info("Wiggle: right done — returning to centre.")
+            else:
+                twist.angular.z = -LOST_LINE_WIGGLE_SPEED
+
+        elif self._wiggle_phase == 2:                      # ── back to centre ──
+            if abs(diff) <= centre_rad:
+                self._wiggle_phase = 3
+                self.get_logger().info("Wiggle: centred — turning left.")
+            else:
+                twist.angular.z = LOST_LINE_WIGGLE_SPEED  # turn left to return
+
+        elif self._wiggle_phase == 3:                      # ── turn LEFT ──
+            if diff >= wiggle_rad:
+                self._wiggle_phase = 4
+                self.get_logger().info("Wiggle: left done — returning to centre.")
+            else:
+                twist.angular.z = LOST_LINE_WIGGLE_SPEED
+
+        elif self._wiggle_phase == 4:                      # ── back to centre ──
+            if abs(diff) <= centre_rad:
+                self._wiggle_phase = 5
+                self.get_logger().info("Wiggle complete — no line found, stopping.")
+            else:
+                twist.angular.z = -LOST_LINE_WIGGLE_SPEED  # turn right to return
+
+        elif self._wiggle_phase == 5:                      # ── give up ──
+            pass                                            # twist stays zero
+
+    # ------------------------------------------------------------------
     def _tick_approaching(self, twist: Twist, t: float,
                           line_ok: bool, heading_err: float, lat_err_px: float):
         traveled = math.hypot(
@@ -767,14 +871,31 @@ class VisionSlamNode(Node):
             self._command_dynamic_turn(
                 self.pending_turn_direction, self.pending_turn_priority)
             return
-        self._tick_follow_line(twist, t, line_ok, heading_err, lat_err_px)
+
+        if line_ok:
+            # Line visible — PID steers us to the junction
+            self._tick_follow_line(twist, t, line_ok, heading_err, lat_err_px)
+        else:
+            # Line lost at the junction (horizontal tape, gap, or turn point).
+            # Drive straight at base speed — odometry still tracks distance,
+            # so the turn will trigger correctly when target_travel_dist is reached.
+            # Do NOT stop here; stopping = traveled never increases = deadlock.
+            twist.linear.x = FORWARD_SPEED
 
     # ------------------------------------------------------------------
     def _tick_stopping(self, twist: Twist, t: float,
                        line_ok: bool, heading_err: float, lat_err_px: float):
         if t - self.state_entry_time >= STOP_DURATION_SEC:
-            self.get_logger().info("STOP complete — resuming line follow.")
-            self._enter_state("FOLLOW_LINE")
+            if self.inevitable_turn_pending:
+                # A turn was scheduled before the stop — resume the approach.
+                # action_start and target_travel_dist are still set from _schedule_turn;
+                # robot didn't move during STOPPING so odometry resumes correctly.
+                self.get_logger().info(
+                    "STOP complete — inevitable turn pending, resuming approach.")
+                self._enter_state("APPROACHING", self.pending_turn_priority)
+            else:
+                self.get_logger().info("STOP complete — resuming line follow.")
+                self._enter_state("FOLLOW_LINE")
         # twist stays at zero while waiting
 
     # ------------------------------------------------------------------
@@ -858,13 +979,18 @@ class VisionSlamNode(Node):
     # ================================================================
 
     def _process_detections(self, t: float, detections: list) -> None:
-        valid_bypasses = ["LEFT", "RIGHT", "FORWARD"]
+        valid_bypasses = ["LEFT", "RIGHT", "TURN LEFT", "TURN RIGHT", "FORWARD", "GO FORWARD"]
         in_cooldown    = t <= self.cooldown_until
         is_searching   = self.nav_state == "SEARCHING"
 
         if in_cooldown:
-            if not (is_searching and
-                    any(d['label'] in valid_bypasses for d in detections)):
+            # Higher-priority signs (e.g. STOP during a turn approach) can override cooldown.
+            has_priority_override = any(
+                ACTION_PRIORITY.get(d['label'], 0) > self.active_priority
+                for d in detections
+            )
+            if not has_priority_override and not (
+                    is_searching and any(d['label'] in valid_bypasses for d in detections)):
                 return
 
         best_label    = None
@@ -875,21 +1001,41 @@ class VisionSlamNode(Node):
             label    = det['label']
             is_escape = is_searching and label in valid_bypasses
 
-            # Distance gate (escape signs bypass it)
-            if not is_escape and det['distance'] > ACTION_DISTANCE_CM:
+            # Distance gate:
+            #   TURN signs  — no upper cap. They fire at first detection and that
+            #                  detected distance becomes the approach distance, so the
+            #                  robot drives to exactly where the sign is before turning.
+            #   All others  — must be within ACTION_DISTANCE_CM (escape signs bypass).
+            if not is_escape and label not in TURN_LABELS \
+                    and det['distance'] > ACTION_DISTANCE_CM:
+                self.get_logger().debug(
+                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: beyond {ACTION_DISTANCE_CM}cm")
+                continue
+
+            # NO ENTRY: reject when too close — model misclassifies other signs at short range
+            if label == "NO ENTRY" and det['distance'] < NO_ENTRY_MIN_DISTANCE_CM:
+                self.get_logger().debug(
+                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: too close (min {NO_ENTRY_MIN_DISTANCE_CM}cm)")
                 continue
 
             # Temporal filter: label must be confirmed in >= N of last M ticks
             if TEMPORAL_FILTER_ENABLED and \
                     sum(self._detection_window.get(label, [])) < DETECTION_MIN_COUNT:
+                self.get_logger().debug(
+                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: temporal filter "
+                    f"({sum(self._detection_window.get(label,[]))}/{DETECTION_MIN_COUNT})")
                 continue
 
             priority = ACTION_PRIORITY.get(label, 0)
 
             if in_cooldown and not is_escape:
+                self.get_logger().debug(
+                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: cooldown active")
                 continue
 
-            if priority < self.active_priority:
+            if priority < self.active_priority and not is_escape:
+                self.get_logger().debug(
+                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: priority {priority} < active {self.active_priority}")
                 continue
 
             if (priority > best_priority or
@@ -904,6 +1050,10 @@ class VisionSlamNode(Node):
                 f"dist={best_dist:.1f}cm  pri={best_priority}")
             self.cooldown_until = t + SIGN_COOLDOWN_SEC
             self._action_dispatch[best_label](t, best_dist)
+        elif best_label:
+            self.get_logger().warn(
+                f"[det] {best_label} passed all filters but has NO dispatch handler — "
+                f"check label name matches action_dispatch keys")
 
     # ================================================================
     #  CONTROL LOOP  (10 Hz)
