@@ -1,17 +1,20 @@
 import os
+from pathlib import Path
+
 import cv2
 from ultralytics import YOLO
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # 1. Load your exact trained weights
-    model = YOLO("../weights/best.pt")
+    weights_path = Path(__file__).parent.parent / "weights" / "best.pt"
+    model = YOLO(weights_path)
 
     # 2. Point this to the directory containing your images
     image_dir = "/Users/ali/Downloads/limo_caps/forward-right-left"
 
     # 3. Loop through all valid image files in the directory
     for filename in os.listdir(image_dir):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        if filename.lower().endswith((".png", ".jpg", ".jpeg")):
             image_path = os.path.join(image_dir, filename)
 
             # Run inference with the exact size you trained on
@@ -43,8 +46,12 @@ if __name__ == '__main__':
                         box_b = boxes[j]
 
                         # Check if Box A completely surrounds Box B
-                        if (box_a[0] <= box_b[0] and box_a[1] <= box_b[1] and
-                                box_a[2] >= box_b[2] and box_a[3] >= box_b[3]):
+                        if (
+                            box_a[0] <= box_b[0]
+                            and box_a[1] <= box_b[1]
+                            and box_a[2] >= box_b[2]
+                            and box_a[3] >= box_b[3]
+                        ):
                             is_encapsulating = True
                             break  # Flag the giant box for removal
 
@@ -61,7 +68,7 @@ if __name__ == '__main__':
 
             # Wait for user to press a key before moving to the next image
             key = cv2.waitKey(0)
-            if key == 27 or key == ord('q'):
+            if key == 27 or key == ord("q"):
                 break
 
     # Clean up when done
