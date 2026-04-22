@@ -1,3 +1,6 @@
 .idea/
-.venv
+.venv/
+.env
 robotics-vision2
+
+test-set/
