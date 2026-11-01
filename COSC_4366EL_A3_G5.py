@@ -17,28 +17,71 @@ vision_slam_node.py — AgileX LIMO autonomous navigation node.
  Claude was essential to ensure that deliverables made on-time and with
  sufficient quality.
 
-Integrates:
-  • ROI-based green line following with EMA-smoothed centroid PID  [LimoPathFollower]
-  • Geometric YOLO distance estimation + strict box filtering       [LimoVisionNode]
-  • Priority-driven, interrupt-capable state machine
-  • VSLAM odometry mapping with live top-down visualisation
-  • OpenCV direct camera (cv2.VideoCapture(0)) — no ROS image topic
+Overview
+────────
+The robot behaves like a car driving on a green-tape road network with
+floor-mounted traffic signs.
 
-State machine:  FOLLOW_LINE → APPROACHING → TURNING_DYNAMIC
-                           ↘ STOPPING
-                           ↘ SEARCHING → TURNING_DYNAMIC  (alternate path)
-                                       → TURNING_FIXED    (180° retreat)
+  Perception (worker thread, camera FPS)
+    • Line: the ROI is scanned in horizontal bands; in each band the tape
+      segment closest to the previous one is kept (continuity tracking), so
+      side branches and crossing tape never pull the robot off its path.
+      A straight-line fit through the band centres gives lateral offset and
+      heading.  Bands where the tape is much wider than one strip are
+      crossings and are skipped.
+    • Junction: rows where green spans most of the frame width mark the
+      crossing tape ahead; its distance is used to reject signs that lie
+      beyond the junction (they belong to other approaches).
+    • Signs: every YOLO box is projected onto the floor with the pinhole
+      camera model → (forward cm, lateral cm).  A sign only applies to us if
+      it lies in OUR lane corridor: right of the strip (quadrant 4), before
+      the junction, within decision range.  Roadblocks (DEAD END / NO ENTRY)
+      may also sit straight ahead on the path (top of a T).  Everything on
+      the left, far right, or past the junction belongs to someone else.
 
-PID:    Single lateral-offset PID on ROI centroid X, EMA-smoothed.
-        Heading angle retained only for horizontal-line rejection and
-        SEARCHING alternate-path detection — never fed into PID.
+  Decision (JunctionPlan)
+    • Lane-gated sightings are accumulated as evidence for the next junction.
+      Each label must be seen in CONFIRM_HITS frames; LEFT/RIGHT/FORWARD
+      compete by summed confidence (majority vote absorbs model flicker).
+    • The nearest sign is the anchor; signs further than SAME_JUNCTION_CM
+      past it belong to the next junction and are ignored.
+    • The plan fires on odometry distance (path length) so it still works
+      after the sign has left the camera's view:
+          STOP        → stop AT the sign for STOP_DURATION_SEC, then continue
+          TURN L/R    → drive to sign + TURN_OFFSET_CM, rotate until the new
+                        line is centred and vertical
+          GO FORWARD  → cross the junction ignoring signs and branches
+          roadblock   → if a direction sign is present follow it, else U-turn
+          no sign     → go straight
+    • Once a junction is handled its location becomes a "handled zone":
+      signs there are ignored until the robot has left it (replaces timers).
+    • Signs are only read in FOLLOW and STOP — never while turning, crossing
+      or searching, which is when the camera sweeps across other lanes.
+
+  Control (20 Hz)
+    ω = −(K_LATERAL·lateral + K_HEADING·heading), speed reduced while steering.
+    The heading term is the physical derivative of the lateral error, so no
+    separate D / I terms, EMA, or derivative-kick handling are needed.
+
+States:  FOLLOW ──► STOP ──► FOLLOW
+           │  ├───► TURN  ──► FOLLOW
+           │  ├───► CROSS ──► FOLLOW
+           │  └───► UTURN ──► FOLLOW
+           └──────► LOST (coast over gaps → wiggle R/L → wait) ──► FOLLOW
+
+VSLAM: odometry trajectory + sign landmarks placed with their true bearing,
+clustered on insert, rendered at 2 Hz and saved to JSON on shutdown.
 """
 
+from __future__ import annotations
+
+import json
 import math
 import threading
-import json
 import time
-from collections import defaultdict, deque
+from collections import namedtuple
+from dataclasses import dataclass, field
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -51,501 +94,215 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
 from ultralytics import YOLO
 
 # ============================================================
-#  CONFIGURATION CONSTANTS
+#  CONFIGURATION
 # ============================================================
 
-# -- Odometry --
-ODOM_TOPIC_CANDIDATES = [
-    '/odom',
-    '/limo_base/odom',
-    '/ackermann_odom',
-    '/wheel/odom',
-]
+# -- ROS ----------------------------------------------------
+ODOM_TOPIC_CANDIDATES = ['/odom', '/limo_base/odom', '/ackermann_odom', '/wheel/odom']
+CONTROL_LOOP_HZ = 20
 
-# -- Camera (OpenCV direct, no ROS subscription) ------------
+# -- Camera -------------------------------------------------
 CAMERA_INDEX = 0
-IMAGE_WIDTH = 640
-IMAGE_HEIGHT = 480
-IMAGE_CENTER_X = IMAGE_WIDTH // 2
+IMAGE_WIDTH, IMAGE_HEIGHT = 640, 480
+CX, CY = IMAGE_WIDTH / 2.0, IMAGE_HEIGHT / 2.0
+SHOW_WINDOWS = True
 OVERLAY_ALPHA = 0.5
-CAMERA_LOOP_HZ = 30
-CAMERA_LOOP_PERIOD = 1.0 / CAMERA_LOOP_HZ
 
-# -- ROI trapezoid (bottom-focused, matches tested tuning) --
-# ROI_SCALE: multiplier applied to the base trapezoid shape.
-# 1.0 = original (bottom 200-440, top 280-360, top-y 200).
-# Increase to widen/raise the ROI, decrease to narrow/lower it.
-ROI_SCALE = 1.0
-_roi_bx_half  = int(120 * ROI_SCALE)   # half-width at bottom from centre (base=120)
-_roi_tx_half  = int( 40 * ROI_SCALE)   # half-width at top    from centre (base=40)
-_roi_top_y    = int(480 - (280 * ROI_SCALE))  # top edge y (base height=280px → top at y=200)
-_roi_top_y    = max(0, _roi_top_y)     # clamp so it never goes off-screen
-ROI_VERTICES = np.array([[
-    (IMAGE_CENTER_X - _roi_bx_half, 480),
-    (IMAGE_CENTER_X - _roi_tx_half, _roi_top_y),
-    (IMAGE_CENTER_X + _roi_tx_half, _roi_top_y),
-    (IMAGE_CENTER_X + _roi_bx_half, 480),
-]], dtype=np.int32)
+# -- Camera geometry (tuned on robot) -----------------------
+CAMERA_HEIGHT_CM = 20.0
+CAMERA_TILT_DEG = 36.0          # below horizontal
+V_FOV_DEG = 48.0
+DISTANCE_CORRECTION_FACTOR = 1.0
+DISTANCE_OFFSET_CM = -5.0
+FOCAL_PX = CY / math.tan(math.radians(V_FOV_DEG / 2))   # square pixels → HFOV ≈ 61°
+_TILT = math.radians(CAMERA_TILT_DEG)
 
-# -- HSV Green Tape -----------------------------------------
+# -- Green tape ---------------------------------------------
 HSV_LOWER_GREEN = np.array([35, 40, 40])
 HSV_UPPER_GREEN = np.array([85, 255, 255])
-MIN_CONTOUR_AREA = 1000
-HORIZONTAL_THRESHOLD_DEG = 65  # Contours more horizontal than this are ignored
+TAPE_WIDTH_CM = 5.0                      # physical strip width — measure yours
+MAX_SEGMENT_CM = 1.8 * TAPE_WIDTH_CM     # wider = crossing tape or fork → band skipped
+MIN_SEGMENT_CM = 0.4 * TAPE_WIDTH_CM     # narrower = noise
 
-# -- EMA smoothing ------------------------------------------
-EMA_ALPHA = 0.75  # Higher = more responsive, lower = smoother
+# Line-tracking region (trapezoid). Wider than a plain centroid ROI because
+# continuity tracking — not the ROI — is what rejects side branches.
+ROI_VERTICES = np.array([[(120, 480), (200, 220), (440, 220), (520, 480)]], dtype=np.int32)
+BAND_TOP_Y = 220
+BAND_HEIGHT_PX = 20
+MAX_BAND_JUMP_PX = 50       # max x-shift between neighbouring bands
+MIN_LINE_POINTS = 3
+LATERAL_REF_Y = 440         # row at which lateral error is measured
 
-# -- Geometric Distance Model (tuned on physical robot) -----
-CAMERA_HEIGHT_CM = 20.0
-CAMERA_TILT_DEG = 36.0
-V_FOV = 48.0
-DISTANCE_CORRECTION_FACTOR = 1.0
-DISTANCE_OFFSET = -5.0
-ACTION_DISTANCE_CM = 25.0        # Signs beyond this are ignored
-NO_ENTRY_MIN_DISTANCE_CM = 15.0  # NO ENTRY ignored below this — prevents close-range misclassification
-MIN_BOX_HEIGHT_PX = 10
+# Junction (crossing tape) detection on the full-width mask
+JUNCTION_SCAN_TOP_Y = 160
+JUNCTION_ROW_COVERAGE = 0.45   # fraction of row width that must be green
+JUNCTION_MIN_ROWS = 4
 
 # -- YOLO ---------------------------------------------------
-YOLO_MODEL_PATH = (
-    "/home/agilex/limo5_ws/src/cosc_4366el_a2_g5/cosc_4366el_a2_g5/best.pt"
-)
-YOLO_CONFIDENCE = 0.5
-DEAD_END_CONFIDENCE = 0.35  # Lower threshold for DEAD END only (higher FN cost than FP)
-MAX_BOX_AREA_RATIO = 0.20   # Boxes > 20% of frame area are rejected as noise
+YOLO_MODEL_PATH = "/home/agilex/limo5_ws/src/cosc_4366el_a2_g5/cosc_4366el_a2_g5/best.pt"
+DEFAULT_CONFIDENCE = 0.5
+LABEL_CONFIDENCE = {"DEAD END": 0.35}   # DEAD END: missing it costs more than a false hit
+MAX_BOX_AREA_RATIO = 0.20
+MIN_BOX_HEIGHT_PX = 10
+NO_ENTRY_MIN_DISTANCE_CM = 15.0         # model mislabels other signs as NO ENTRY up close
 
-# -- Temporal filtering ("Don't Blink" rule) ----------------
-# A sign is only acted on if seen in >= DETECTION_MIN_COUNT
-# of the last DETECTION_WINDOW_SIZE control-loop ticks (10 Hz).
-TEMPORAL_FILTER_ENABLED = False  # Set True to require N detections in M ticks before acting
-DETECTION_WINDOW_SIZE   = 5     # M — rolling window length
-DETECTION_MIN_COUNT     = 3     # N — minimum hits required to confirm
+# -- Labels -------------------------------------------------
+TURN_LEFT, TURN_RIGHT, GO_FORWARD = "TURN LEFT", "TURN RIGHT", "GO FORWARD"
+STOP, DEAD_END, NO_ENTRY = "STOP", "DEAD END", "NO ENTRY"
+DIRECTION_LABELS = (TURN_LEFT, TURN_RIGHT, GO_FORWARD)
+ROADBLOCK_LABELS = (DEAD_END, NO_ENTRY)
+LABEL_ALIASES = {"FORWARD": GO_FORWARD}
 
-# -- ROS ----------------------------------------------------
-PUBLISHER_QUEUE_SIZE = 10
-CONTROL_LOOP_HZ = 10
-CONTROL_LOOP_PERIOD = 1.0 / CONTROL_LOOP_HZ
+# -- Lane corridor (which signs are ours) -------------------
+# Robot-relative floor coordinates of the sign centre; lateral + = right.
+DECISION_DISTANCE_CM = 45.0     # signs further than this are not read yet
+ROADBLOCK_DECISION_CM = 35.0
+RIGHT_LANE_MIN_CM = 4.0         # quadrant 4: right of the strip …
+RIGHT_LANE_MAX_CM = 30.0        # … but not as far as the next lane over
+CENTER_LANE_HALF_CM = 8.0       # roadblocks may also sit on the path (top of a T)
+JUNCTION_MARGIN_CM = 3.0        # sign centre may not lie past the crossing tape
+JUNCTION_MEMORY_CM = 30.0       # junction position is remembered until passed by this
 
-# -- Motion watchdog ----------------------------------------
-# Detects cases where we command non-trivial motion but odometry reports
-# the robot is not actually moving — i.e. commands aren't reaching the base.
-WATCHDOG_ENABLED          = True
-WATCHDOG_MIN_CMD_LINEAR   = 0.02   # m/s     — commanded speed considered "should move"
-WATCHDOG_MIN_CMD_ANGULAR  = 0.05   # rad/s   — commanded rotation considered "should move"
-WATCHDOG_POSITION_EPS_M   = 0.01   # m       — position drift tolerated as "not moving"
-WATCHDOG_YAW_EPS_RAD      = 0.015  # rad     — yaw drift tolerated as "not moving"
-WATCHDOG_STALL_TIMEOUT_S  = 2.0    # seconds of continuous stall before warning fires
-WATCHDOG_REBOOT_TIMEOUT_S = 4.0    # seconds of continuous stall before publisher is recreated
-WATCHDOG_REBOOT_COOLDOWN  = 10.0   # seconds between consecutive publisher rebuilds
-
-# -- Movement & PID (tuned values from LimoPathFollower) ----
-FORWARD_SPEED = 0.07        # m/s
-TURN_SPEED = 0.30           # rad/s — used during TURNING_DYNAMIC / TURNING_FIXED
-SENSITIVITY = 1.0           # Global gain multiplier on PID output
-MAX_ANGULAR = 0.20          # rad/s hard clamp on published angular.z
-
-# Lateral centroid PID gains (pixel-space error)
-KP = 0.005
-KI = 0.0001
-KD = 0.001
-MAX_WINDUP = 1.0            # Integral anti-windup clamp
-
-SEVERE_LATERAL_OFFSET = 60  # px — speed halved above this to aid recovery
-
-# -- Lost-line wiggle ("look around" before giving up) ------
-LOST_LINE_WIGGLE_ANGLE_DEG  = 45.0  # degrees swept each side (right then left)
-LOST_LINE_WIGGLE_SPEED      = 0.20  # rad/s rotation speed during wiggle
-LOST_LINE_CENTER_THRESH_DEG = 3.0   # degrees tolerance to call "back at neutral"
-
-# -- State Machine Timing -----------------------------------
+# -- Junction plan ------------------------------------------
+CONFIRM_HITS = 3                # frames a label (group) must be seen in
+SAME_JUNCTION_CM = 12.0         # signs further than anchor+this → next junction
+PLAN_EXPIRE_CM = 10.0           # unconfirmed evidence dropped once passed by this
+PLAN_ABORT_CM = 60.0            # safety: confirmed plan never fired → drop
+HANDLED_ZONE_RADIUS_CM = 30.0   # signs near a handled junction are ignored …
+HANDLED_ZONE_CLEAR_CM = 45.0    # … until the robot is this far away from it
+STOP_OFFSET_CM = 0.0            # stop when the robot reaches the STOP sign
+TURN_OFFSET_CM = 8.0            # turn this far past the sign (junction centre)
+FORWARD_OFFSET_CM = 30.0        # cross this far past the sign before reading again
+UTURN_STANDOFF_CM = 15.0        # U-turn this far before a roadblock
 STOP_DURATION_SEC = 3.0
-SEARCH_TURN_SPEED = 0.20
-SEARCH_TIMEOUT_SEC = 4.0
-SEARCH_PATH_ANGLE = 0.40    # rad — heading deviation that signals an alternate path
-TURN_DONE_THRESH = 0.08         # rad — yaw error threshold for TURNING_FIXED completion
-DYNAMIC_TURN_MIN_ANGLE_DEG = 35.0  # deg — minimum odom turn before line-latch is allowed
-SIGN_COOLDOWN_SEC = 5.0
-STOP_COOLDOWN_SEC = 10.0        # Per-label cooldown on STOP — prevents re-triggering on the same sign
-TURN_DISTANCE_OFFSET_CM = 8.0   # Robot drives (sign_distance + this offset) before turning
-FORWARD_DISTANCE_OFFSET_CM = 30.0  # Robot drives (sign_distance + this offset) past a FORWARD sign
-                                # before accepting any new directional command.
-INTERSECTION_PROXIMITY_CM = 5.0 # If a non-turn sign is closer than a turn sign by this much,
-                                # the turn is rejected — the closer sign owns the intersection.
 
-# -- Action Priority ----------------------------------------
-# Labels exactly as output by the YOLO model (uppercased in VisionProcessor)
-TURN_LABELS = {"TURN LEFT", "TURN RIGHT"}   # turn signs fire at first detection, not at 25cm cap
+# -- Motion -------------------------------------------------
+FORWARD_SPEED = 0.07            # m/s
+MAX_ANGULAR = 0.20              # rad/s clamp while line following
+K_LATERAL = 1.2                 # rad/s per unit normalised lateral error
+K_HEADING = 0.4                 # rad/s per rad of line heading
+STEER_SLOWDOWN = 0.5            # speed × (1 − this) at full steering
 
-# Directional commands — FORWARD, LEFT, RIGHT compete first-come-first-served.
-# Once one is committed, the others are ignored until the action's cooldown clears.
-# STOP, NO ENTRY and DEAD END are NOT directional — they bypass this lock.
-DIRECTIONAL_LABELS = {"TURN LEFT", "TURN RIGHT", "FORWARD", "GO FORWARD"}
+TURN_SPEED = 0.30               # rad/s for TURN / UTURN
+TURN_MIN_ANGLE_DEG = 45.0       # don't latch onto the original line
+TURN_MAX_ANGLE_DEG = 200.0      # give up and search
+TURN_EXIT_HEADING_RAD = 0.35    # new line must be roughly vertical …
+TURN_EXIT_LATERAL = 0.5         # … and roughly centred
+YAW_TOLERANCE_RAD = 0.06
 
-ACTION_PRIORITY = {
-    # Turns outrank all roadblocks — an explicit turn direction is always
-    # a legal alternative to a dead-end or no-entry straight ahead.
-    "TURN RIGHT": 5,
-    "TURN LEFT":  5,
-    # Roadblocks — trigger a 180° retreat when no turn is present.
-    "NO ENTRY":   4,
-    "DEAD END":   4,
-    # STOP is handled specially when paired with a TURN in the same frame
-    # (see _process_detections): the robot stops, then continues the turn.
-    "STOP":       3,
-    # Forward is the floor — any other sign supersedes it.
-    "FORWARD":    1,
-    "GO FORWARD": 1,   # model outputs "GO FORWARD", not "FORWARD"
-}
-IDLE_PRIORITY = 0
+GAP_COAST_SEC = 1.5             # drive straight over dashed-tape gaps first
+WIGGLE_ANGLES_DEG = (-45.0, 0.0, 45.0, 0.0)   # right, centre, left, centre
+WIGGLE_SPEED = 0.20
+
+# -- Motion watchdog (warning only) -------------------------
+WATCHDOG_ENABLED = True
+WATCHDOG_MIN_CMD_LINEAR = 0.02
+WATCHDOG_MIN_CMD_ANGULAR = 0.05
+WATCHDOG_POSITION_EPS_M = 0.01
+WATCHDOG_YAW_EPS_RAD = 0.015
+WATCHDOG_STALL_TIMEOUT_S = 2.0
 
 # -- VSLAM --------------------------------------------------
 MAP_SAVE_PATH = "/home/agilex/limo5_ws/src/cosc_4366el_a2_g5/cosc_4366el_a2_g5/vslam_map.json"
+MAP_RENDER_PERIOD = 0.5
+MAP_MIN_STEP_M = 0.02
+MAP_MAX_SIGN_RANGE_CM = 60.0
 MAP_VISUALIZATION_SCALE = 120   # px per metre
-MAP_UPDATE_INTERVAL = 0.5       # s between map snapshots
-MAP_MIN_SIZE_PX = 500           # minimum rendered width / height
-MAP_MAX_SIZE_PX = 1400          # cap to keep it reasonable at long runs
-MAP_GRID_SPACING_M = 0.5        # grid lines every 0.5 m
-MAP_SIGN_CLUSTER_M = 0.20       # same label within 20 cm is merged into one marker
-MAP_ARROW_EVERY_N  = 20         # draw a direction arrow every N trajectory points
+MAP_MIN_SIZE_PX = 500
+MAP_MAX_SIZE_PX = 1400
+MAP_GRID_SPACING_M = 0.5
+MAP_SIGN_CLUSTER_M = 0.20
+MAP_ARROW_EVERY_N = 20
 
 
 # ============================================================
-#  GEOMETRIC DISTANCE ESTIMATION
+#  GEOMETRY
 # ============================================================
 
-def estimate_distance_geometry(y_pixel: float) -> float:
+def wrap(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def pixel_to_ground(u: float, v: float):
     """
-    Floor-projection using camera geometry (height + tilt + vFOV).
-    y_pixel is the bottom edge of the bounding box in image coordinates.
-    Returns distance in cm; math.inf when the pixel is too close to horizon.
+    Project an image pixel onto the floor (pinhole model, camera pitched down).
+    Returns (forward_cm, lateral_cm, cm_per_px) with lateral + = right,
+    or None if the pixel is at/above the horizon.
     """
-    # Invert so that pixels near the bottom map to shorter distances
-    relative_y = ((IMAGE_HEIGHT / 2) - y_pixel) / (IMAGE_HEIGHT / 2)
-    pixel_angle_offset = relative_y * (V_FOV / 2)
-    total_angle_deg = (90.0 - CAMERA_TILT_DEG) + pixel_angle_offset
-
-    if total_angle_deg >= 89.0:
-        return math.inf
-
-    raw_dist = CAMERA_HEIGHT_CM * math.tan(math.radians(total_angle_deg))
-    corrected = raw_dist * DISTANCE_CORRECTION_FACTOR + DISTANCE_OFFSET
-    return max(0.0, corrected)
+    xn, yn = (u - CX) / FOCAL_PX, (v - CY) / FOCAL_PX
+    denom = math.sin(_TILT) + yn * math.cos(_TILT)
+    if denom < 0.02:
+        return None
+    depth = CAMERA_HEIGHT_CM / denom
+    fwd = depth * (math.cos(_TILT) - yn * math.sin(_TILT))
+    fwd = max(0.0, fwd * DISTANCE_CORRECTION_FACTOR + DISTANCE_OFFSET_CM)
+    return fwd, depth * xn, depth / FOCAL_PX
 
 
-# ============================================================
-#  VSLAM MAPPER
-# ============================================================
+def ground_to_pixel(fwd_cm: float, lat_cm: float):
+    """Inverse of pixel_to_ground (for drawing). Returns (u, v) or None."""
+    raw = (fwd_cm - DISTANCE_OFFSET_CM) / DISTANCE_CORRECTION_FACTOR
+    if raw <= 0:
+        return None
+    yn = math.tan(math.atan2(CAMERA_HEIGHT_CM, raw) - _TILT)
+    depth = CAMERA_HEIGHT_CM / (math.sin(_TILT) + yn * math.cos(_TILT))
+    return int(CX + FOCAL_PX * lat_cm / depth), int(CY + FOCAL_PX * yn)
 
-class VSLAMMapper:
-    """
-    Lightweight occupancy-style mapper driven by odometry + YOLO detections.
-    Stores the robot trajectory and the global position of every detected sign.
-    Saves to JSON on shutdown; renders a top-down OpenCV image at runtime.
-    """
 
-    def __init__(self, save_path: str):
-        self.save_path = save_path
-        self.trajectory: list = []            # [(x, y, yaw, t), ...]
-        self.signs: dict = defaultdict(list)  # {label: [(x, y, t), ...]}
-        self.lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    def update(self, robot_x: float, robot_y: float, robot_yaw: float,
-               detections: list, timestamp: float) -> None:
-        with self.lock:
-            self.trajectory.append((robot_x, robot_y, robot_yaw, timestamp))
-            for det in detections:
-                dist_m = det['distance'] / 100.0
-                sx = robot_x + dist_m * math.cos(robot_yaw)
-                sy = robot_y + dist_m * math.sin(robot_yaw)
-                self.signs[det['label']].append((sx, sy, timestamp))
-
-    # ------------------------------------------------------------------
-    def save_map(self) -> None:
-        with self.lock:
-            data = {
-                'trajectory': self.trajectory,
-                'signs': dict(self.signs),
-            }
-        try:
-            with open(self.save_path, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as exc:
-            print(f"[VSLAMMapper] Save error: {exc}")
-
-    # ------------------------------------------------------------------
-    # Colours (BGR) for each model label actually produced by YOLO.
-    # Kept as a class-level dict so the legend and marker-draw use the same source.
-    SIGN_COLORS = {
-        "TURN LEFT":  (255, 128,   0),   # cyan-blue
-        "TURN RIGHT": (  0, 200, 255),   # amber
-        "NO ENTRY":   (100,   0, 220),   # magenta-red
-        "DEAD END":   ( 80,  80,  80),   # grey
-        "STOP":       (  0,   0, 230),   # red
-        "FORWARD":    ( 80, 220,  80),   # green
-        "GO FORWARD": ( 80, 220,  80),   # green (alias)
-    }
-    BG_COLOR       = ( 28,  28,  32)     # near-black
-    GRID_COLOR     = ( 55,  55,  62)
-    AXIS_COLOR     = ( 90,  90, 100)
-    TEXT_COLOR     = (220, 220, 220)
-    START_COLOR    = (  0, 200,   0)
-    ROBOT_COLOR    = ( 80, 255, 255)     # bright cyan
-    TRAIL_NEW      = (255, 200,  80)     # bright blue-ish for recent trail
-    TRAIL_OLD      = ( 60,  70,  90)     # dim for old trail
-
-    # ------------------------------------------------------------------
-    def _cluster_signs(self, signs_snap: dict) -> dict:
-        """
-        Merge same-label detections within MAP_SIGN_CLUSTER_M into one marker
-        with a hit count. Keeps the map readable when a sign is seen many times.
-        Returns {label: [(x, y, count), ...]}.
-        """
-        clustered = {}
-        for label, pts in signs_snap.items():
-            buckets: list = []   # list of [sum_x, sum_y, count]
-            for sx, sy, _ in pts:
-                placed = False
-                for b in buckets:
-                    mx, my = b[0] / b[2], b[1] / b[2]
-                    if math.hypot(sx - mx, sy - my) <= MAP_SIGN_CLUSTER_M:
-                        b[0] += sx; b[1] += sy; b[2] += 1
-                        placed = True
-                        break
-                if not placed:
-                    buckets.append([sx, sy, 1])
-            clustered[label] = [(b[0] / b[2], b[1] / b[2], b[2]) for b in buckets]
-        return clustered
-
-    # ------------------------------------------------------------------
-    def visualize(self):
-        """Top-down map: dark theme, grid, gradient trail, clustered signs, legend, scale bar."""
-        with self.lock:
-            if not self.trajectory:
-                return None
-            traj = list(self.trajectory)
-            signs_snap = {k: list(v) for k, v in self.signs.items()}
-
-        # ── Compute world bounds ─────────────────────────────────────
-        all_x = [p[0] for p in traj]
-        all_y = [p[1] for p in traj]
-        for lst in signs_snap.values():
-            all_x.extend(s[0] for s in lst)
-            all_y.extend(s[1] for s in lst)
-
-        pad = 0.8
-        min_x, max_x = min(all_x) - pad, max(all_x) + pad
-        min_y, max_y = min(all_y) - pad, max(all_y) + pad
-
-        # Reserve width on the right for the legend panel
-        legend_w = 190
-        w_core = int((max_x - min_x) * MAP_VISUALIZATION_SCALE)
-        h      = int((max_y - min_y) * MAP_VISUALIZATION_SCALE)
-        w_core = max(MAP_MIN_SIZE_PX - legend_w,
-                     min(w_core, MAP_MAX_SIZE_PX - legend_w))
-        h      = max(MAP_MIN_SIZE_PX, min(h, MAP_MAX_SIZE_PX))
-        w      = w_core + legend_w
-
-        img = np.full((h, w, 3), self.BG_COLOR, dtype=np.uint8)
-
-        def to_px(x, y):
-            return (
-                int((x - min_x) * MAP_VISUALIZATION_SCALE),
-                h - int((y - min_y) * MAP_VISUALIZATION_SCALE),
-            )
-
-        # ── Grid ─────────────────────────────────────────────────────
-        gs = MAP_GRID_SPACING_M
-        # Vertical grid lines
-        gx = math.ceil(min_x / gs) * gs
-        while gx <= max_x:
-            px = to_px(gx, 0)[0]
-            if 0 <= px < w_core:
-                cv2.line(img, (px, 0), (px, h), self.GRID_COLOR, 1)
-                cv2.putText(img, f"{gx:+.1f}", (px + 2, h - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.AXIS_COLOR, 1)
-            gx += gs
-        # Horizontal grid lines
-        gy = math.ceil(min_y / gs) * gs
-        while gy <= max_y:
-            py = to_px(0, gy)[1]
-            if 0 <= py < h:
-                cv2.line(img, (0, py), (w_core, py), self.GRID_COLOR, 1)
-                cv2.putText(img, f"{gy:+.1f}", (4, py - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.AXIS_COLOR, 1)
-            gy += gs
-
-        # Separator between map area and legend panel
-        cv2.line(img, (w_core, 0), (w_core, h), self.AXIS_COLOR, 1)
-
-        # ── Trajectory as colour-gradient polyline ───────────────────
-        n = len(traj)
-        for i in range(1, n):
-            # age factor 0 (oldest) → 1 (newest)
-            f = i / max(1, n - 1)
-            col = tuple(int(self.TRAIL_OLD[k] * (1 - f) + self.TRAIL_NEW[k] * f)
-                        for k in range(3))
-            p1 = to_px(traj[i - 1][0], traj[i - 1][1])
-            p2 = to_px(traj[i][0],     traj[i][1])
-            cv2.line(img, p1, p2, col, 2, cv2.LINE_AA)
-
-        # Direction arrows along the trail
-        if n >= MAP_ARROW_EVERY_N:
-            for i in range(MAP_ARROW_EVERY_N, n, MAP_ARROW_EVERY_N):
-                x, y, yaw, _ = traj[i]
-                tip = to_px(x + 0.08 * math.cos(yaw),
-                            y + 0.08 * math.sin(yaw))
-                base = to_px(x, y)
-                cv2.arrowedLine(img, base, tip, self.TRAIL_NEW, 1,
-                                cv2.LINE_AA, tipLength=0.5)
-
-        # ── Start marker ─────────────────────────────────────────────
-        sx, sy = traj[0][0], traj[0][1]
-        sp = to_px(sx, sy)
-        cv2.circle(img, sp, 8, self.START_COLOR, 2, cv2.LINE_AA)
-        cv2.circle(img, sp, 3, self.START_COLOR, -1)
-        cv2.putText(img, "START", (sp[0] + 10, sp[1] + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.START_COLOR, 1)
-
-        # ── Robot position + heading (triangle) ──────────────────────
-        rx, ry, ryaw = traj[-1][:3]
-        rp = to_px(rx, ry)
-        tri_len = 14; tri_wid = 8
-        tip   = (rp[0] + int(tri_len * math.cos(ryaw)),
-                 rp[1] - int(tri_len * math.sin(ryaw)))
-        left  = (rp[0] + int(tri_wid * math.cos(ryaw + 2.5)),
-                 rp[1] - int(tri_wid * math.sin(ryaw + 2.5)))
-        right = (rp[0] + int(tri_wid * math.cos(ryaw - 2.5)),
-                 rp[1] - int(tri_wid * math.sin(ryaw - 2.5)))
-        cv2.fillPoly(img, [np.array([tip, left, right], dtype=np.int32)],
-                     self.ROBOT_COLOR)
-        cv2.polylines(img, [np.array([tip, left, right], dtype=np.int32)],
-                      True, (0, 0, 0), 1, cv2.LINE_AA)
-
-        # ── Detected signs (clustered, with hit count) ───────────────
-        clustered = self._cluster_signs(signs_snap)
-        for label, pts in clustered.items():
-            col = self.SIGN_COLORS.get(label, (160, 160, 160))
-            for (cx, cy, count) in pts:
-                p = to_px(cx, cy)
-                # Filled disc + black outline for readability
-                cv2.circle(img, p, 10, col, -1, cv2.LINE_AA)
-                cv2.circle(img, p, 10, (0, 0, 0), 1, cv2.LINE_AA)
-                if count > 1:
-                    cv2.putText(img, f"x{count}", (p[0] - 10, p[1] + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
-
-        # ── Scale bar (bottom-left of map area) ──────────────────────
-        sb_len_m = 1.0
-        sb_len_px = int(sb_len_m * MAP_VISUALIZATION_SCALE)
-        sb_x0, sb_y = 12, h - 24
-        cv2.line(img, (sb_x0, sb_y), (sb_x0 + sb_len_px, sb_y),
-                 self.TEXT_COLOR, 2)
-        cv2.line(img, (sb_x0, sb_y - 4), (sb_x0, sb_y + 4),
-                 self.TEXT_COLOR, 2)
-        cv2.line(img, (sb_x0 + sb_len_px, sb_y - 4),
-                 (sb_x0 + sb_len_px, sb_y + 4), self.TEXT_COLOR, 2)
-        cv2.putText(img, f"{sb_len_m:.1f} m",
-                    (sb_x0 + sb_len_px // 2 - 18, sb_y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.TEXT_COLOR, 1)
-
-        # ── Legend panel ─────────────────────────────────────────────
-        lx = w_core + 14
-        ly = 24
-        cv2.putText(img, "VSLAM Map", (lx, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.TEXT_COLOR, 2)
-        ly += 24
-
-        # Path
-        cv2.line(img, (lx, ly), (lx + 28, ly), self.TRAIL_NEW, 2, cv2.LINE_AA)
-        cv2.putText(img, "Path (new)", (lx + 36, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1)
-        ly += 18
-        cv2.line(img, (lx, ly), (lx + 28, ly), self.TRAIL_OLD, 2, cv2.LINE_AA)
-        cv2.putText(img, "Path (old)", (lx + 36, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1)
-        ly += 22
-
-        # Robot + start
-        cv2.circle(img, (lx + 14, ly), 5, self.START_COLOR, 2)
-        cv2.putText(img, "Start", (lx + 36, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1)
-        ly += 18
-        tri_pts = np.array([(lx + 22, ly - 6), (lx + 6, ly - 1),
-                            (lx + 6, ly + 5)], dtype=np.int32)
-        cv2.fillPoly(img, [tri_pts], self.ROBOT_COLOR)
-        cv2.putText(img, "Robot", (lx + 36, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1)
-        ly += 22
-
-        # Signs header
-        cv2.putText(img, "Signs", (lx, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.TEXT_COLOR, 1)
-        ly += 14
-        cv2.line(img, (lx, ly), (lx + legend_w - 28, ly),
-                 self.AXIS_COLOR, 1)
-        ly += 14
-
-        # De-duplicate GO FORWARD / FORWARD share a colour
-        seen_colors = set()
-        for label, col in self.SIGN_COLORS.items():
-            key = (label if col not in seen_colors else None)
-            if col in seen_colors:
-                continue
-            seen_colors.add(col)
-            cv2.circle(img, (lx + 10, ly - 4), 6, col, -1, cv2.LINE_AA)
-            cv2.circle(img, (lx + 10, ly - 4), 6, (0, 0, 0), 1, cv2.LINE_AA)
-            # Use shorter display name where applicable
-            display = "FORWARD" if label in ("FORWARD", "GO FORWARD") else label
-            count_total = sum(len(v) for k, v in clustered.items()
-                              if self.SIGN_COLORS.get(k) == col)
-            suffix = f"  ({count_total})" if count_total else ""
-            cv2.putText(img, f"{display}{suffix}", (lx + 24, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, self.TEXT_COLOR, 1)
-            ly += 18
-
-        # ── Stats footer ─────────────────────────────────────────────
-        ly = h - 40
-        total_dist = 0.0
-        for i in range(1, len(traj)):
-            total_dist += math.hypot(traj[i][0] - traj[i-1][0],
-                                     traj[i][1] - traj[i-1][1])
-        cv2.putText(img, f"Points: {len(traj)}",
-                    (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.TEXT_COLOR, 1)
-        cv2.putText(img, f"Dist:   {total_dist:.2f} m",
-                    (lx, ly + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.TEXT_COLOR, 1)
-        cv2.putText(img, f"Pose: ({rx:+.2f}, {ry:+.2f})",
-                    (lx, ly + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.TEXT_COLOR, 1)
-
-        return img
+def _runs(flags: np.ndarray):
+    """[(start, end_exclusive), ...] of consecutive True values."""
+    d = np.diff(np.concatenate(([0], flags.astype(np.int8), [0])))
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
 # ============================================================
-#  VISION PROCESSOR
+#  VISION
 # ============================================================
+
+@dataclass
+class Line:
+    ok: bool = False
+    lateral: float = 0.0        # normalised [-1, 1]; + = line right of centre
+    heading: float = 0.0        # rad; + = line leans right going away
+    points: list = field(default_factory=list)
+    fit: Optional[tuple] = None  # (slope, intercept) of x = slope·y + intercept
+
+
+@dataclass
+class Sign:
+    label: str
+    conf: float
+    box: tuple
+    fwd_cm: float               # to the near edge of the sign
+    lat_cm: float               # sign centre, + = right
+    fwd_centre_cm: float
+    reject: str = ""            # empty → in our lane
+
+    @property
+    def centre_lane(self) -> bool:
+        return self.label in ROADBLOCK_LABELS and abs(self.lat_cm) <= CENTER_LANE_HALF_CM
+
+
+@dataclass
+class VisionResult:
+    line: Line
+    signs: list
+    junction_cm: Optional[float]
+    display: np.ndarray
+    mask: np.ndarray
+
 
 class VisionProcessor:
-    """
-    Per-frame green-line detection and YOLO sign detection.
-
-    Line detection
-    ──────────────
-    HSV mask → ROI clip → contour filter (area + horizontal rejection)
-    Returns centroid lateral offset (px) as the PID error signal.
-    Heading angle is also returned but used only by the SEARCHING state —
-    it is never fed into the PID controller.
-    Horizontal contours are drawn in olive and discarded.
-
-    Sign detection
-    ──────────────
-    Strict box filtering from LimoVisionNode:
-      • Boxes occupying > MAX_BOX_AREA_RATIO of the frame are dropped.
-      • Parent boxes that fully contain a smaller detection are dropped.
-    Distance is calculated via estimate_distance_geometry().
-    """
-
-    def __init__(self, model_path: str, confidence: float):
-        self.confidence = confidence
+    def __init__(self, model_path: str):
+        self._last_x = CX
+        self._kernel = np.ones((5, 5), np.uint8)
+        self._roi = np.zeros((IMAGE_HEIGHT, IMAGE_WIDTH), np.uint8)
+        cv2.fillPoly(self._roi, ROI_VERTICES, 255)
+        corners = [ground_to_pixel(f, l) for f, l in (
+            (10, RIGHT_LANE_MIN_CM), (DECISION_DISTANCE_CM, RIGHT_LANE_MIN_CM),
+            (DECISION_DISTANCE_CM, RIGHT_LANE_MAX_CM), (10, RIGHT_LANE_MAX_CM))]
+        self._corridor_px = np.array(corners, np.int32)
+        self._min_conf = min([DEFAULT_CONFIDENCE, *LABEL_CONFIDENCE.values()])
         try:
             self.model = YOLO(model_path)
             print("[VisionProcessor] YOLO model loaded.")
@@ -554,170 +311,355 @@ class VisionProcessor:
             self.model = None
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _contour_angle_and_centroid(contour):
-        """
-        Returns (heading_err_rad, lateral_err_px, is_horizontal).
-        heading_err = angle from vertical (used for horizontal filtering +
-                      SEARCHING path detection, NOT for PID).
-        """
-        [vx, vy, _cx, _cy] = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
-        vx, vy = float(vx), float(vy)
-        if vy > 0:
-            vx, vy = -vx, -vy
+    def process(self, frame: np.ndarray) -> VisionResult:
+        frame = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT))
+        mask = cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV),
+                           HSV_LOWER_GREEN, HSV_UPPER_GREEN)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel, iterations=2)
 
-        heading_err = math.atan2(vx, -vy)
-        is_horizontal = abs(math.degrees(heading_err)) > HORIZONTAL_THRESHOLD_DEG
-
-        M = cv2.moments(contour)
-        lat_err = (M['m10'] / M['m00'] - IMAGE_CENTER_X) if M['m00'] > 0 else 0.0
-        return heading_err, lat_err, is_horizontal
+        junction_cm = self._find_junction(mask)
+        lane_mask = cv2.bitwise_and(mask, self._roi)
+        line = self._track_line(lane_mask)
+        signs = self._detect_signs(frame, junction_cm)
+        display = self._draw(frame, lane_mask, line, signs, junction_cm)
+        return VisionResult(line, signs, junction_cm, display, lane_mask)
 
     # ------------------------------------------------------------------
-    def process_frame(self, frame: np.ndarray):
-        """
-        Returns
-        -------
-        display     : annotated BGR image
-        green_mask  : binary mask after ROI clip
-        line_ok     : True when a usable vertical line is found
-        heading_err : rad from vertical (secondary info — not for PID)
-        lat_err_px  : raw centroid X offset in pixels (PID input)
-        detections  : list of {label, distance, conf}
-        """
-        frame = cv2.resize(frame, (IMAGE_WIDTH, IMAGE_HEIGHT))
-        display = frame.copy()
-
-        # ── Green mask ──────────────────────────────────────────────
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        kernel = np.ones((5, 5), np.uint8)
-        green_mask = cv2.inRange(hsv, HSV_LOWER_GREEN, HSV_UPPER_GREEN)
-        green_mask = cv2.dilate(green_mask, kernel, iterations=4)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
-
-        # ── Apply ROI ───────────────────────────────────────────────
-        roi_mask = np.zeros(green_mask.shape, dtype=np.uint8)
-        cv2.fillPoly(roi_mask, ROI_VERTICES, 255)
-        green_mask = cv2.bitwise_and(green_mask, roi_mask)
-
-        # ROI outline + centre line on display
-        cv2.polylines(display, [ROI_VERTICES], True, (0, 0, 200), 1)
-        overlay = cv2.bitwise_and(frame, frame, mask=green_mask)
-        cv2.addWeighted(overlay, OVERLAY_ALPHA, display, 1 - OVERLAY_ALPHA, 0, display)
-        cv2.line(display, (IMAGE_CENTER_X, 0), (IMAGE_CENTER_X, IMAGE_HEIGHT),
-                 (255, 0, 0), 1)
-
-        # ── Contour analysis ────────────────────────────────────────
-        line_ok    = False
-        heading_err = 0.0
-        lat_err_px  = 0.0
-
-        contours, _ = cv2.findContours(
-            green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        valid_contours = []
-        for cnt in contours:
-            if cv2.contourArea(cnt) < MIN_CONTOUR_AREA:
+    def _track_line(self, mask: np.ndarray) -> Line:
+        """Band scan, bottom → top, following the segment nearest the last one."""
+        pts = []
+        x_pred = self._last_x
+        for y_bot in range(IMAGE_HEIGHT, BAND_TOP_Y, -BAND_HEIGHT_PX):
+            band = mask[y_bot - BAND_HEIGHT_PX:y_bot]
+            y_mid = y_bot - BAND_HEIGHT_PX / 2.0
+            cm_per_px = pixel_to_ground(CX, y_mid)[2]
+            cols = np.count_nonzero(band, axis=0) > BAND_HEIGHT_PX // 2
+            segs = [(a, b) for a, b in _runs(cols) if (b - a) * cm_per_px >= MIN_SEGMENT_CM]
+            if not segs:
                 continue
-            h_err, l_err, is_horiz = self._contour_angle_and_centroid(cnt)
-            if is_horiz:
-                # Acknowledged but excluded — draw in olive for operator visibility
-                cv2.drawContours(display, [cnt], -1, (30, 120, 30), 1)
-                cv2.putText(display, "HORIZ (ignored)",
-                            (int(cnt[0][0][0]), int(cnt[0][0][1]) - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (30, 120, 30), 1)
+            a, b = min(segs, key=lambda s: abs((s[0] + s[1]) / 2.0 - x_pred))
+            x_mid = (a + b) / 2.0
+            if (b - a) * cm_per_px > MAX_SEGMENT_CM:
+                continue    # crossing tape / fork merge: no reliable lateral info
+            if pts and abs(x_mid - x_pred) > MAX_BAND_JUMP_PX:
                 continue
-            valid_contours.append(cnt)
+            pts.append((x_mid, y_mid))
+            x_pred = x_mid
 
-        if valid_contours:
-            best = max(valid_contours, key=cv2.contourArea)
-            line_ok = True
-            heading_err, lat_err_px, _ = self._contour_angle_and_centroid(best)
+        if len(pts) < MIN_LINE_POINTS:
+            self._last_x = CX
+            return Line(points=pts)
 
-            # Draw fit-line
-            [vx, vy, x, y] = cv2.fitLine(best, cv2.DIST_L2, 0, 0.01, 0.01)
-            vx, vy = float(vx), float(vy)
-            if vy > 0:
-                vx, vy = -vx, -vy
-            cv2.line(display,
-                     (int(x - vx * 1000), int(y - vy * 1000)),
-                     (int(x + vx * 1000), int(y + vy * 1000)),
-                     (0, 0, 255), 2)
+        xs, ys = np.array(pts).T
+        slope, icpt = np.polyfit(ys, xs, 1)
+        self._last_x = float(xs[0])
+        x_ref = slope * LATERAL_REF_Y + icpt
+        return Line(ok=True,
+                    lateral=float(np.clip((x_ref - CX) / CX, -1.0, 1.0)),
+                    heading=float(math.atan(-slope)),
+                    points=pts, fit=(float(slope), float(icpt)))
 
-            # Draw centroid + lateral offset indicator
-            M = cv2.moments(best)
-            if M['m00'] > 0:
-                cx_px = int(M['m10'] / M['m00'])
-                cy_px = int(M['m01'] / M['m00'])
-                cv2.circle(display, (cx_px, cy_px), 6, (0, 255, 255), -1)
-                cv2.line(display, (IMAGE_CENTER_X, cy_px), (cx_px, cy_px),
-                         (0, 255, 255), 2)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_junction(mask: np.ndarray) -> Optional[float]:
+        """Forward distance (cm) to the near edge of the closest crossing tape."""
+        cover = (np.count_nonzero(mask[JUNCTION_SCAN_TOP_Y:], axis=1)
+                 > JUNCTION_ROW_COVERAGE * IMAGE_WIDTH)
+        bands = [(a, b) for a, b in _runs(cover) if b - a >= JUNCTION_MIN_ROWS]
+        if not bands:
+            return None
+        g = pixel_to_ground(CX, JUNCTION_SCAN_TOP_Y + bands[-1][1] - 1)
+        return g[0] if g else None
 
-        # ── YOLO detections with strict box filtering ────────────────
-        detections = []
-        if self.model:
-            # Run at the lower threshold so DEAD END boxes aren't suppressed
-            # at inference time; per-label gates are applied below.
-            infer_conf = min(self.confidence, DEAD_END_CONFIDENCE)
-            results = self.model(frame, conf=infer_conf, verbose=False)
-            result  = results[0]
+    # ------------------------------------------------------------------
+    def _detect_signs(self, frame: np.ndarray, junction_cm) -> list:
+        if self.model is None:
+            return []
+        res = self.model(frame, conf=self._min_conf, agnostic_nms=True, verbose=False)[0]
+        boxes = [(tuple(float(v) for v in b.xyxy[0]), str(res.names[int(b.cls[0])]),
+                  float(b.conf[0])) for b in res.boxes]
+        max_area = MAX_BOX_AREA_RATIO * IMAGE_WIDTH * IMAGE_HEIGHT
 
-            keep_indices = []
-            if len(result.boxes) > 0:
-                boxes    = result.boxes.xyxy
-                img_h, img_w = result.orig_shape
-                max_area = MAX_BOX_AREA_RATIO * img_w * img_h
+        signs = []
+        for i, ((x1, y1, x2, y2), name, conf) in enumerate(boxes):
+            label = LABEL_ALIASES.get(name.upper(), name.upper())
+            if conf < LABEL_CONFIDENCE.get(label, DEFAULT_CONFIDENCE):
+                continue
+            if (x2 - x1) * (y2 - y1) > max_area or (y2 - y1) < MIN_BOX_HEIGHT_PX:
+                continue
+            # A box that fully contains another box is a mis-detection
+            if any(j != i and x1 <= o[0] and y1 <= o[1] and x2 >= o[2] and y2 >= o[3]
+                   for j, (o, _, _) in enumerate(boxes)):
+                continue
+            uc = (x1 + x2) / 2.0
+            near, centre = pixel_to_ground(uc, y2), pixel_to_ground(uc, (y1 + y2) / 2.0)
+            if near is None or centre is None:
+                continue
+            s = Sign(label, conf, (int(x1), int(y1), int(x2), int(y2)),
+                     near[0], centre[1], centre[0])
+            s.reject = self._lane_check(s, junction_cm)
+            signs.append(s)
+        return signs
 
-                for i in range(len(boxes)):
-                    bx = boxes[i]
-                    # Reject oversized boxes
-                    if (bx[2] - bx[0]) * (bx[3] - bx[1]) > max_area:
-                        continue
-                    # Reject boxes that fully contain a smaller sibling
-                    encapsulates = any(
-                        j != i
-                        and bx[0] <= boxes[j][0] and bx[1] <= boxes[j][1]
-                        and bx[2] >= boxes[j][2] and bx[3] >= boxes[j][3]
-                        for j in range(len(boxes))
-                    )
-                    if not encapsulates:
-                        keep_indices.append(i)
+    @staticmethod
+    def _lane_check(s: Sign, junction_cm) -> str:
+        """Return '' if the sign applies to our lane, else the reason it doesn't."""
+        roadblock = s.label in ROADBLOCK_LABELS
+        if s.label == NO_ENTRY and s.fwd_cm < NO_ENTRY_MIN_DISTANCE_CM:
+            return "too close"
+        if s.fwd_cm > (ROADBLOCK_DECISION_CM if roadblock else DECISION_DISTANCE_CM):
+            return "too far"
+        if s.lat_cm < (-CENTER_LANE_HALF_CM if roadblock else RIGHT_LANE_MIN_CM):
+            return "left side"
+        if s.lat_cm > RIGHT_LANE_MAX_CM:
+            return "far right"
+        if (not s.centre_lane and junction_cm is not None
+                and s.fwd_centre_cm > junction_cm + JUNCTION_MARGIN_CM):
+            return "past junction"
+        return ""
 
-                result.boxes = result.boxes[keep_indices]
+    # ------------------------------------------------------------------
+    def _draw(self, frame, mask, line: Line, signs: list, junction_cm) -> np.ndarray:
+        out = frame.copy()
+        green = cv2.bitwise_and(frame, frame, mask=mask)
+        cv2.addWeighted(green, OVERLAY_ALPHA, out, 1 - OVERLAY_ALPHA, 0, out)
+        cv2.polylines(out, ROI_VERTICES, True, (0, 0, 200), 1)
+        cv2.polylines(out, [self._corridor_px], True, (0, 200, 200), 1)   # our sign corridor
+        cv2.line(out, (int(CX), 0), (int(CX), IMAGE_HEIGHT), (255, 0, 0), 1)
 
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                if (y2 - y1) < MIN_BOX_HEIGHT_PX:
-                    continue
+        for x, y in line.points:
+            cv2.circle(out, (int(x), int(y)), 4, (0, 255, 255), -1)
+        if line.fit:
+            m, c = line.fit
+            cv2.line(out, (int(m * IMAGE_HEIGHT + c), IMAGE_HEIGHT),
+                     (int(m * BAND_TOP_Y + c), BAND_TOP_Y), (0, 0, 255), 2)
 
-                label = str(result.names[int(box.cls[0])]).upper()
-                conf  = float(box.conf[0])
+        if junction_cm is not None:
+            p = ground_to_pixel(junction_cm, 0)
+            if p:
+                cv2.line(out, (0, p[1]), (IMAGE_WIDTH, p[1]), (255, 0, 255), 1)
+                cv2.putText(out, f"junction {junction_cm:.0f}cm", (IMAGE_WIDTH - 150, p[1] - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-                # Per-label confidence gate applied after inference
-                threshold = DEAD_END_CONFIDENCE if label == "DEAD END" else YOLO_CONFIDENCE
-                if conf < threshold:
-                    continue
+        for s in signs:
+            col = (0, 220, 0) if not s.reject else (0, 0, 230)
+            x1, y1, x2, y2 = s.box
+            cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
+            cv2.putText(out, f"{s.label} {s.conf:.2f} f{s.fwd_cm:.0f} l{s.lat_cm:+.0f}",
+                        (x1, y1 - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1)
+            if s.reject:
+                cv2.putText(out, s.reject, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-                dist_cm = estimate_distance_geometry(float(y2))
+        col = (0, 255, 0) if line.ok else (0, 0, 255)
+        cv2.putText(out, f"line {'OK' if line.ok else 'LOST'}  lat {line.lateral:+.2f}  "
+                         f"head {line.heading:+.2f}rad",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+        return out
 
-                detections.append({'label': label, 'distance': dist_cm, 'conf': conf})
 
-                cv2.rectangle(display, (x1, y1), (x2, y2), (255, 50, 50), 2)
-                dist_txt = f"{dist_cm:.1f}cm" if dist_cm != math.inf else "Too Far"
-                cv2.putText(display, f"{label} {conf:.2f} | {dist_txt}",
-                            (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (255, 50, 50), 2)
+# ============================================================
+#  JUNCTION PLAN
+# ============================================================
 
-        # ── HUD ─────────────────────────────────────────────────────
-        hud_col = (0, 255, 0) if line_ok else (0, 0, 255)
-        cv2.putText(display,
-                    f"L_err: {lat_err_px:+.1f}px  |  H_err: {heading_err:+.2f}rad (info)",
-                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        cv2.putText(display,
-                    f"line: {'TRACKING' if line_ok else 'LOST / HORIZ IGNORED'}",
-                    (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_col, 1)
+PlanView = namedtuple("PlanView", "anchor anchor_xy direction stop roadblock odo roadblock_odo")
 
-        return display, green_mask, line_ok, heading_err, lat_err_px, detections
+
+class JunctionPlan:
+    """
+    Evidence about the next junction, built from lane-gated sign sightings.
+    Each label keeps its hit count, summed confidence, and the latest estimate
+    of where it is in odometer metres (latest = closest = most accurate).
+    """
+
+    def __init__(self):
+        self.evidence = {}
+        self.stop_done = False
+
+    def add(self, sign: Sign, target_odo: float, xy: tuple) -> None:
+        e = self.evidence.setdefault(sign.label, {"hits": 0, "score": 0.0})
+        e["hits"] += 1
+        e["score"] += sign.conf
+        e.update(odo=target_odo, xy=xy, centre=sign.centre_lane)
+
+    def resolve(self) -> PlanView:
+        side = [l for l, e in self.evidence.items() if not e["centre"]]
+        anchor_label = min(side or self.evidence, key=lambda l: self.evidence[l]["odo"])
+        anchor = self.evidence[anchor_label]["odo"]
+        # Signs well past the anchor belong to the next junction
+        ev = {l: e for l, e in self.evidence.items()
+              if e["centre"] or e["odo"] <= anchor + SAME_JUNCTION_CM / 100.0}
+
+        def hits(labels):
+            return sum(ev[l]["hits"] for l in labels if l in ev)
+
+        dirs = [l for l in DIRECTION_LABELS if l in ev]
+        direction = (max(dirs, key=lambda l: ev[l]["score"])
+                     if hits(DIRECTION_LABELS) >= CONFIRM_HITS else None)
+        rb = [ev[l]["odo"] for l in ROADBLOCK_LABELS if l in ev]
+        return PlanView(anchor, self.evidence[anchor_label]["xy"], direction,
+                        hits((STOP,)) >= CONFIRM_HITS, hits(ROADBLOCK_LABELS) >= CONFIRM_HITS,
+                        {l: e["odo"] for l, e in ev.items()}, min(rb) if rb else math.inf)
+
+    def summary(self) -> str:
+        r = self.resolve()
+        return (f"dir={r.direction or '-'} stop={'Y' if r.stop else '-'}"
+                f"{'(done)' if self.stop_done else ''} block={'Y' if r.roadblock else '-'}")
+
+
+# ============================================================
+#  VSLAM MAPPER
+# ============================================================
+
+class VSLAMMapper:
+    """Odometry trajectory + sign landmarks (clustered on insert)."""
+
+    SIGN_COLORS = {
+        TURN_LEFT: (255, 128, 0), TURN_RIGHT: (0, 200, 255), NO_ENTRY: (100, 0, 220),
+        DEAD_END: (80, 80, 80), STOP: (0, 0, 230), GO_FORWARD: (80, 220, 80),
+    }
+    BG, GRID, AXIS, TEXT = (28, 28, 32), (55, 55, 62), (90, 90, 100), (220, 220, 220)
+    START, ROBOT = (0, 200, 0), (80, 255, 255)
+    TRAIL_NEW, TRAIL_OLD = (255, 200, 80), (60, 70, 90)
+
+    def __init__(self, save_path: str):
+        self.save_path = save_path
+        self.trajectory = []      # [(x, y, yaw, t)]
+        self.landmarks = {}       # label → [[x, y, count]]
+        self.events = []          # [(action, x, y, t)]
+        self.lock = threading.Lock()
+
+    def add_pose(self, x, y, yaw, t) -> None:
+        with self.lock:
+            if self.trajectory:
+                px, py, pyaw, _ = self.trajectory[-1]
+                if math.hypot(x - px, y - py) < MAP_MIN_STEP_M and abs(wrap(yaw - pyaw)) < 0.1:
+                    return
+            self.trajectory.append((x, y, yaw, t))
+
+    def add_landmark(self, label, x, y) -> None:
+        with self.lock:
+            clusters = self.landmarks.setdefault(label, [])
+            for c in clusters:
+                if math.hypot(x - c[0], y - c[1]) <= MAP_SIGN_CLUSTER_M:
+                    c[2] += 1
+                    c[0] += (x - c[0]) / c[2]
+                    c[1] += (y - c[1]) / c[2]
+                    return
+            clusters.append([x, y, 1])
+
+    def add_event(self, action, x, y, t) -> None:
+        with self.lock:
+            self.events.append((action, x, y, t))
+
+    def save(self) -> None:
+        with self.lock:
+            data = {'trajectory': self.trajectory, 'landmarks': self.landmarks,
+                    'events': self.events}
+        try:
+            with open(self.save_path, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            print(f"[VSLAMMapper] Save error: {exc}")
+
+    # ------------------------------------------------------------------
+    def render(self):
+        with self.lock:
+            if not self.trajectory:
+                return None
+            traj = list(self.trajectory)
+            marks = {l: [tuple(c) for c in cs] for l, cs in self.landmarks.items()}
+            events = list(self.events)
+
+        xs = [p[0] for p in traj] + [c[0] for cs in marks.values() for c in cs]
+        ys = [p[1] for p in traj] + [c[1] for cs in marks.values() for c in cs]
+        pad, S, legend_w = 0.8, MAP_VISUALIZATION_SCALE, 190
+        min_x, max_x, min_y, max_y = min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad
+        w_core = int(np.clip((max_x - min_x) * S, MAP_MIN_SIZE_PX - legend_w,
+                             MAP_MAX_SIZE_PX - legend_w))
+        h = int(np.clip((max_y - min_y) * S, MAP_MIN_SIZE_PX, MAP_MAX_SIZE_PX))
+        img = np.full((h, w_core + legend_w, 3), self.BG, np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        def px(x, y):
+            return int((x - min_x) * S), h - int((y - min_y) * S)
+
+        # Grid
+        gs = MAP_GRID_SPACING_M
+        for gx in np.arange(math.ceil(min_x / gs) * gs, max_x, gs):
+            u = px(gx, 0)[0]
+            if 0 <= u < w_core:
+                cv2.line(img, (u, 0), (u, h), self.GRID, 1)
+                cv2.putText(img, f"{gx:+.1f}", (u + 2, h - 6), font, 0.35, self.AXIS, 1)
+        for gy in np.arange(math.ceil(min_y / gs) * gs, max_y, gs):
+            v = px(0, gy)[1]
+            if 0 <= v < h:
+                cv2.line(img, (0, v), (w_core, v), self.GRID, 1)
+                cv2.putText(img, f"{gy:+.1f}", (4, v - 3), font, 0.35, self.AXIS, 1)
+        cv2.line(img, (w_core, 0), (w_core, h), self.AXIS, 1)
+
+        # Trail (old → new colour gradient) + direction arrows
+        n = len(traj)
+        for i in range(1, n):
+            f = i / max(1, n - 1)
+            col = tuple(int(o + (nw - o) * f) for o, nw in zip(self.TRAIL_OLD, self.TRAIL_NEW))
+            cv2.line(img, px(*traj[i - 1][:2]), px(*traj[i][:2]), col, 2, cv2.LINE_AA)
+        for x, y, yaw, _ in traj[MAP_ARROW_EVERY_N::MAP_ARROW_EVERY_N]:
+            cv2.arrowedLine(img, px(x, y), px(x + 0.08 * math.cos(yaw), y + 0.08 * math.sin(yaw)),
+                            self.TRAIL_NEW, 1, cv2.LINE_AA, tipLength=0.5)
+
+        # Start
+        sp = px(*traj[0][:2])
+        cv2.circle(img, sp, 8, self.START, 2, cv2.LINE_AA)
+        cv2.putText(img, "START", (sp[0] + 10, sp[1] + 4), font, 0.4, self.START, 1)
+
+        # Landmarks
+        for label, cs in marks.items():
+            col = self.SIGN_COLORS.get(label, (160, 160, 160))
+            for x, y, cnt in cs:
+                p = px(x, y)
+                cv2.circle(img, p, 10, col, -1, cv2.LINE_AA)
+                cv2.circle(img, p, 10, (0, 0, 0), 1, cv2.LINE_AA)
+                if cnt > 1:
+                    cv2.putText(img, f"x{cnt}", (p[0] - 10, p[1] + 4), font, 0.35, (0, 0, 0), 1)
+
+        # Executed actions
+        for action, x, y, _ in events:
+            p = px(x, y)
+            cv2.rectangle(img, (p[0] - 7, p[1] - 7), (p[0] + 7, p[1] + 7), self.TEXT, 1)
+            cv2.putText(img, action[0], (p[0] - 4, p[1] + 4), font, 0.4, self.TEXT, 1)
+
+        # Robot
+        rx, ry, ryaw, _ = traj[-1]
+        rp = px(rx, ry)
+        tri = np.array([(rp[0] + int(r * math.cos(ryaw + a)), rp[1] - int(r * math.sin(ryaw + a)))
+                        for r, a in ((14, 0), (8, 2.5), (8, -2.5))], np.int32)
+        cv2.fillPoly(img, [tri], self.ROBOT)
+        cv2.polylines(img, [tri], True, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # Scale bar
+        x0, yb, L = 12, h - 24, S
+        cv2.line(img, (x0, yb), (x0 + L, yb), self.TEXT, 2)
+        cv2.putText(img, "1.0 m", (x0 + L // 2 - 18, yb - 8), font, 0.45, self.TEXT, 1)
+
+        # Legend
+        lx, ly = w_core + 14, 24
+        cv2.putText(img, "VSLAM Map", (lx, ly), font, 0.7, self.TEXT, 2)
+        ly += 30
+        for label, col in self.SIGN_COLORS.items():
+            cv2.circle(img, (lx + 10, ly - 4), 6, col, -1, cv2.LINE_AA)
+            cnt = len(marks.get(label, []))
+            cv2.putText(img, f"{label}  ({cnt})" if cnt else label, (lx + 24, ly),
+                        font, 0.42, self.TEXT, 1)
+            ly += 18
+        cv2.putText(img, "[L/R/F/S/U] = action", (lx, ly + 6), font, 0.38, self.TEXT, 1)
+
+        dist = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(traj, traj[1:]))
+        for k, txt in enumerate((f"Points: {n}", f"Dist:   {dist:.2f} m",
+                                 f"Pose: ({rx:+.2f}, {ry:+.2f})")):
+            cv2.putText(img, txt, (lx, h - 40 + 14 * k), font, 0.4, self.TEXT, 1)
+        return img
 
 
 # ============================================================
@@ -728,268 +670,100 @@ class VisionSlamNode(Node):
 
     def __init__(self):
         super().__init__('vision_slam_node')
+        self.vision = VisionProcessor(YOLO_MODEL_PATH)
+        self.mapper = VSLAMMapper(MAP_SAVE_PATH)
 
-        # ── Subsystems ──────────────────────────────────────────────
-        self._vis_lock = threading.Lock()
-        self.vision    = VisionProcessor(YOLO_MODEL_PATH, YOLO_CONFIDENCE)
-        self.mapper    = VSLAMMapper(MAP_SAVE_PATH)
-
-        # ── OpenCV camera (direct — no ROS image subscription) ──────
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  IMAGE_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
-        if not self.cap.isOpened():
-            self.get_logger().error("Failed to open camera index 0.")
-        self._prev_cam_time = time.time()
-
-        # ── Odometry subscriptions (tries all candidate topics) ─────
-        self._odom_subs      = []
+        # ── Odometry ────────────────────────────────────────────────
+        self.odom_ok = False
         self.active_odom_topic = None
+        self._odom_origin = None
+        self._odom_prev = None
+        self.x = self.y = self.yaw = 0.0
+        self.odometer = 0.0          # path length driven (m) — used for sign distances
         for topic in ODOM_TOPIC_CANDIDATES:
-            sub = self.create_subscription(
-                Odometry, topic,
-                self._make_odom_cb(topic),
-                qos_profile=qos_profile_sensor_data)
-            self._odom_subs.append(sub)
+            self.create_subscription(Odometry, topic, self._make_odom_cb(topic),
+                                     qos_profile_sensor_data)
 
-        # ── ROS publisher ───────────────────────────────────────────
-        # RELIABLE reliability is mandatory here: the LIMO base node subscribes
-        # to /cmd_vel with RELIABLE QoS, and ROS2 refuses delivery between a
-        # BEST_EFFORT publisher and a RELIABLE subscriber ("incompatible QoS,
-        # no messages will be sent"). Depth=1 keeps only the newest command,
-        # which is what we want for a high-rate control loop — stale commands
-        # get superseded rather than queued.
-        self._cmd_qos = QoSProfile(
-            reliability = ReliabilityPolicy.RELIABLE,
-            durability  = DurabilityPolicy.VOLATILE,
-            history     = HistoryPolicy.KEEP_LAST,
-            depth       = 1,
-        )
-        self.cmd_pub = self._create_cmd_publisher()
+        # RELIABLE is mandatory: the LIMO base subscribes to /cmd_vel as RELIABLE
+        # and ROS2 won't connect a BEST_EFFORT publisher to it. Depth 1 keeps
+        # only the newest command.
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.VOLATILE,
+                         history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', qos)
 
-        # ── Odometry state ───────────────────────────────────────────
-        self.odom_ok  = False
-        self.init_x   = self.init_y = self.init_yaw = 0.0
-        self.robot_x  = self.robot_y = self.robot_yaw = 0.0
+        # ── Shared vision result (written by worker thread) ─────────
+        self._vis_lock = threading.Lock()
+        self._vis: Optional[VisionResult] = None
+        self._vis_seq = 0
+        self._last_seq = 0
+        self._hud = ""
 
-        # ── Shared vision state (written by _camera_loop) ────────────
-        self._line_ok     = False
-        self._heading_err = 0.0   # rad — secondary info for SEARCHING, not PID
-        self._lat_err_px  = 0.0   # px  — primary PID input
-        self._detections  = []
+        # ── Navigation ──────────────────────────────────────────────
+        self.state = "FOLLOW"
+        self.state_t = 0.0
+        self.plan: Optional[JunctionPlan] = None
+        self.zone = None             # (x, y) centre of the last handled junction
+        self._fire_xy = None         # robot position when the current manoeuvre began
+        self.junction_odo = None     # odometer position of the crossing tape ahead
+        self.turn_dir = 0
+        self.turn_angle = 0.0
+        self._turn_prev_yaw = 0.0
+        self.target_yaw = 0.0
+        self.cross_end = 0.0
+        self.wiggle = []
 
-        # ── Navigation state machine ─────────────────────────────────
-        self.nav_state        = "FOLLOW_LINE"
-        self.active_priority  = IDLE_PRIORITY
-        self.state_entry_time = 0.0
-        self.target_yaw       = 0.0   # TURNING_FIXED only
-        self.cooldown_until   = 0.0
-        self.stop_cooldown_until = 0.0   # Per-label STOP cooldown (10s) — the same STOP
-                                         # sign will not re-fire within this window.
+        # ── Watchdog ────────────────────────────────────────────────
+        self._wd_ref = None
+        self._wd_warned = 0.0
 
-        # Directional lock: once a directional sign (FORWARD/TURN LEFT/TURN RIGHT)
-        # is committed, this records its label so other directional signs are
-        # ignored until the lock is cleared (cooldown expiry / state change).
-        # STOP, NO ENTRY, DEAD END are not directional and bypass this lock.
-        self._directional_lock_label = None
-
-        # Pending turn
-        self.pending_turn_direction  = ""   # "LEFT" or "RIGHT"
-        self.pending_turn_priority   = 0
-        self.target_travel_dist      = 0.0
-        self.action_start_x          = 0.0
-        self.action_start_y          = 0.0
-        self.search_entry_yaw        = 0.0
-        self.turn_entry_yaw          = 0.0  # odom yaw snapshot at turn start
-        self.inevitable_turn_pending = False  # True while a turn is scheduled but not yet executed
-
-        # ── PID state (single lateral channel + EMA) ─────────────────
-        self.integral     = 0.0
-        self.prev_error   = 0.0
-        self.smooth_error = 0.0
-        self.last_pid_time = 0.0
-
-        # ── Lost-line wiggle state ────────────────────────────────────
-        # Phases: 0=idle  1=turn RIGHT  2=return centre  3=turn LEFT
-        #         4=return centre  5=give up (stop)
-        # _wiggle_done latches True after one full cycle without finding the line.
-        # It's cleared only when the line is re-acquired, so each lost-line
-        # episode yields exactly ONE wiggle cycle.
-        self._wiggle_phase      = 0
-        self._wiggle_origin_yaw = 0.0
-        self._wiggle_done       = False
-
-        # ── Motion watchdog state ────────────────────────────────────
-        # Tracks whether commanded motion is actually producing odom displacement.
-        self._wd_stall_since    = None   # timestamp of first stalled tick (or None)
-        self._wd_last_warn_time = 0.0
-        self._wd_last_reboot    = 0.0
-        self._wd_last_odom_x    = 0.0
-        self._wd_last_odom_y    = 0.0
-        self._wd_last_odom_yaw  = 0.0
-        self._wd_last_cmd_linear  = 0.0
-        self._wd_last_cmd_angular = 0.0
-
-        # ── VSLAM ───────────────────────────────────────────────────
-        self.last_map_update = 0.0
-
-        # ── Temporal detection filter (rolling window per label) ─────
-        # Keyed by label string → deque of 0/1, length DETECTION_WINDOW_SIZE.
-        # Updated every control-loop tick regardless of cooldown state.
-        self._detection_window: dict = defaultdict(
-            lambda: deque(maxlen=DETECTION_WINDOW_SIZE)
-        )
-
-        # ── Dispatch tables ──────────────────────────────────────────
-        self._action_dispatch = {
-            "STOP":        self._on_stop,
-            "FORWARD":     self._on_forward,
-            "GO FORWARD":  self._on_forward,
-            "TURN RIGHT":  self._on_right,
-            "TURN LEFT":   self._on_left,
-            "NO ENTRY":    self._on_dead_end,
-            "DEAD END":    self._on_dead_end,
-        }
-        self._state_dispatch = {
-            "FOLLOW_LINE":     self._tick_follow_line,
-            "APPROACHING":     self._tick_approaching,
-            "STOPPING":        self._tick_stopping,
-            "TURNING_DYNAMIC": self._tick_turning_dynamic,
-            "SEARCHING":       self._tick_searching,
-        }
-
-        # ── Timers ───────────────────────────────────────────────────
-        self.camera_timer  = self.create_timer(CAMERA_LOOP_PERIOD,  self._camera_loop)
-        self.control_timer = self.create_timer(CONTROL_LOOP_PERIOD, self._control_loop)
-
-        self.get_logger().info(
-            "VisionSlamNode ready — camera: OpenCV(0), VSLAM: active.")
+        # ── Camera worker + control timer ───────────────────────────
+        self._cap = cv2.VideoCapture(CAMERA_INDEX)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # always process the newest frame
+        if not self._cap.isOpened():
+            self.get_logger().error(f"Failed to open camera index {CAMERA_INDEX}.")
+        self._running = True
+        self._worker = threading.Thread(target=self._vision_worker, daemon=True)
+        self._worker.start()
+        self.create_timer(1.0 / CONTROL_LOOP_HZ, self._control_loop)
+        self.get_logger().info("VisionSlamNode ready.")
 
     # ================================================================
     #  HELPERS
     # ================================================================
 
-    def _reset_pid(self) -> None:
-        """Clear all PID memory on state transitions into FOLLOW_LINE."""
-        self.integral      = 0.0
-        self.prev_error    = 0.0
-        self.smooth_error  = 0.0
-        self.last_pid_time = 0.0
-
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
-    # ----------------------------------------------------------------
-    def _create_cmd_publisher(self):
-        """Build the /cmd_vel publisher with the volatile QoS profile."""
-        return self.create_publisher(Twist, '/cmd_vel', self._cmd_qos)
+    def _enter(self, state: str) -> None:
+        self.state = state
+        self.state_t = self._now()
+        self.get_logger().info(f"  → {state}")
 
-    def _reboot_cmd_publisher(self, reason: str) -> None:
-        """
-        Destroy and recreate the /cmd_vel publisher mid-execution.
-        Used when the watchdog detects commands aren't being honoured or
-        when publish() raises an exception. This does NOT power-cycle the
-        LIMO base — that requires external intervention — but it clears any
-        stuck state inside rclpy's publisher middleware.
-        """
-        now = self._now()
-        if now - self._wd_last_reboot < WATCHDOG_REBOOT_COOLDOWN:
-            return  # back off — don't thrash
-        self.get_logger().warn(
-            f"Rebooting /cmd_vel publisher: {reason}")
-        try:
-            self.destroy_publisher(self.cmd_pub)
-        except Exception as exc:
-            self.get_logger().error(f"destroy_publisher failed: {exc}")
-        try:
-            self.cmd_pub = self._create_cmd_publisher()
-            self._wd_last_reboot = now
-            self.get_logger().info("Publisher rebuilt — resuming.")
-        except Exception as exc:
-            self.get_logger().error(f"Publisher rebuild failed: {exc}")
+    def _to_world(self, fwd_cm: float, lat_cm: float):
+        """Robot-relative floor point (lateral + = right) → map frame."""
+        f, l = fwd_cm / 100.0, lat_cm / 100.0
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        return self.x + f * c + l * s, self.y + f * s - l * c
 
-    def _publish_cmd(self, twist: Twist) -> None:
-        """
-        Publish a Twist with exception protection. A failing publish()
-        triggers an immediate publisher reboot so the next tick has a
-        chance of succeeding.
-        """
-        try:
-            self.cmd_pub.publish(twist)
-        except Exception as exc:
-            self.get_logger().error(f"cmd_vel publish() raised: {exc}")
-            self._reboot_cmd_publisher(reason=f"publish() exception: {exc}")
+    def _rotate_to(self, twist: Twist, target: float, speed: float) -> bool:
+        diff = wrap(target - self.yaw)
+        if abs(diff) < YAW_TOLERANCE_RAD:
+            return True
+        twist.angular.z = math.copysign(speed, diff)
+        return False
 
-    # ----------------------------------------------------------------
-    def _check_motion_watchdog(self, t: float,
-                               cmd_linear: float, cmd_angular: float) -> None:
-        """
-        Detect: we are commanding non-trivial motion, but odometry reports
-        the robot isn't moving. Either the servos aren't responding, the
-        base driver is frozen, or a wheel/encoder cable is disconnected.
-        From the outside these failures look identical, so the warning
-        is worded to reflect that.
-        """
-        if not WATCHDOG_ENABLED or not self.odom_ok:
-            self._wd_stall_since = None
-            return
-
-        commanding_motion = (abs(cmd_linear)  >= WATCHDOG_MIN_CMD_LINEAR or
-                             abs(cmd_angular) >= WATCHDOG_MIN_CMD_ANGULAR)
-
-        dx   = abs(self.robot_x   - self._wd_last_odom_x)
-        dy   = abs(self.robot_y   - self._wd_last_odom_y)
-        dyaw = abs(self._yaw_diff(self.robot_yaw, self._wd_last_odom_yaw))
-        moved = (math.hypot(dx, dy) > WATCHDOG_POSITION_EPS_M or
-                 dyaw > WATCHDOG_YAW_EPS_RAD)
-
-        # Snapshot odom for next tick
-        self._wd_last_odom_x, self._wd_last_odom_y, self._wd_last_odom_yaw = \
-            self.robot_x, self.robot_y, self.robot_yaw
-
-        if not commanding_motion or moved:
-            # Either nothing was commanded, or the robot actually moved — clear stall.
-            self._wd_stall_since = None
-            return
-
-        # Commanded motion but no odom displacement → stalled
-        if self._wd_stall_since is None:
-            self._wd_stall_since = t
-            return
-
-        stall_duration = t - self._wd_stall_since
-
-        # Warn first
-        if stall_duration >= WATCHDOG_STALL_TIMEOUT_S and \
-                (t - self._wd_last_warn_time) >= 1.0:
-            self.get_logger().warn(
-                f"Motion watchdog: commanded lin={cmd_linear:+.3f} m/s, "
-                f"ang={cmd_angular:+.3f} rad/s for {stall_duration:.1f}s "
-                f"but robot hasn't moved. LIMO base or servos may not be "
-                f"responding — check base node, motor power, and cabling.")
-            self._wd_last_warn_time = t
-
-        # Then attempt publisher reboot
-        if stall_duration >= WATCHDOG_REBOOT_TIMEOUT_S:
-            self._reboot_cmd_publisher(
-                reason=f"no motion for {stall_duration:.1f}s despite commands")
-            # Reset the stall clock so we don't retry continuously —
-            # the reboot cooldown inside _reboot_cmd_publisher also gates this.
-            self._wd_stall_since = t
-
-    def _yaw_diff(self, target: float, current: float) -> float:
-        return math.atan2(math.sin(target - current), math.cos(target - current))
-
-    def _enter_state(self, state: str, priority: int = IDLE_PRIORITY) -> None:
-        if state == "FOLLOW_LINE":
-            self._reset_pid()
-        self.nav_state        = state
-        self.active_priority  = priority
-        self.state_entry_time = self._now()
-        self.get_logger().info(f"  → State: {state}  (priority {priority})")
+    @staticmethod
+    def _steer(twist: Twist, line: Line) -> None:
+        w = -(K_LATERAL * line.lateral + K_HEADING * line.heading)
+        w = float(np.clip(w, -MAX_ANGULAR, MAX_ANGULAR))
+        twist.angular.z = w
+        twist.linear.x = FORWARD_SPEED * (1.0 - STEER_SLOWDOWN * abs(w) / MAX_ANGULAR)
 
     # ================================================================
-    #  ODOMETRY CALLBACK
+    #  ODOMETRY
     # ================================================================
 
     def _make_odom_cb(self, topic: str):
@@ -999,626 +773,269 @@ class VisionSlamNode(Node):
                 self.get_logger().info(f"Odometry latched → {topic}")
             if topic != self.active_odom_topic:
                 return
-            px = msg.pose.pose.position.x
-            py = msg.pose.pose.position.y
-            q  = msg.pose.pose.orientation
-            raw_yaw = math.atan2(
-                2.0 * (q.w * q.z + q.x * q.y),
-                1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-            )
-            if not self.odom_ok:
-                self.init_x, self.init_y, self.init_yaw = px, py, raw_yaw
+            p, q = msg.pose.pose.position, msg.pose.pose.orientation
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            if self._odom_origin is None:
+                self._odom_origin = (p.x, p.y, yaw)
+                self._odom_prev = (p.x, p.y)
                 self.odom_ok = True
-            dx, dy = px - self.init_x, py - self.init_y
-            c, s = math.cos(-self.init_yaw), math.sin(-self.init_yaw)
-            self.robot_x   = dx * c - dy * s
-            self.robot_y   = dx * s + dy * c
-            self.robot_yaw = math.atan2(
-                math.sin(raw_yaw - self.init_yaw),
-                math.cos(raw_yaw - self.init_yaw),
-            )
+            ox, oy, oyaw = self._odom_origin
+            dx, dy = p.x - ox, p.y - oy
+            c, s = math.cos(oyaw), math.sin(oyaw)
+            self.x, self.y = dx * c + dy * s, -dx * s + dy * c
+            self.yaw = wrap(yaw - oyaw)
+            self.odometer += math.hypot(p.x - self._odom_prev[0], p.y - self._odom_prev[1])
+            self._odom_prev = (p.x, p.y)
         return cb
 
     # ================================================================
-    #  CAMERA LOOP  (30 Hz)
+    #  VISION WORKER THREAD (camera FPS, owns all OpenCV windows)
     # ================================================================
 
-    def _camera_loop(self) -> None:
-        """Read one frame, run vision processing, update shared state."""
-        ret, frame = self.cap.read()
-        if not ret:
-            return
-
-        now = time.time()
-        fps = 1.0 / max(now - self._prev_cam_time, 1e-6)
-        self._prev_cam_time = now
-
-        display, mask, line_ok, h_err, l_err, dets = \
-            self.vision.process_frame(frame)
-
-        # Extra HUD overlays
-        cv2.putText(display, f"FPS: {int(fps)}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        cv2.putText(display, f"State: {self.nav_state}",
-                    (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
-
-        with self._vis_lock:
-            self._line_ok     = line_ok
-            self._heading_err = h_err
-            self._lat_err_px  = l_err
-            self._detections  = dets
-
-        cv2.imshow("LIMO Vision + YOLO", display)
-        cv2.imshow("Green Mask (ROI)", mask)
-
-        map_img = self.mapper.visualize()
-        if map_img is not None:
-            cv2.imshow("VSLAM Map", map_img)
-
-        cv2.waitKey(1)
-
-    # ================================================================
-    #  ACTION HANDLERS
-    # ================================================================
-
-    def _on_stop(self, _t, _dist_cm):
-        self._enter_state("STOPPING", ACTION_PRIORITY["STOP"])
-
-    def _on_forward(self, _t, dist_cm):
-        # FORWARD is now stateful: commit to driving past the sign before
-        # accepting any new directional command. Behaves like a turn approach
-        # but resolves to FOLLOW_LINE on completion instead of rotating.
-        self._schedule_forward(ACTION_PRIORITY["FORWARD"], dist_cm)
-
-    def _on_right(self, _t, dist_cm):
-        self._schedule_turn("RIGHT", ACTION_PRIORITY["TURN RIGHT"], dist_cm)
-
-    def _on_left(self, _t, dist_cm):
-        self._schedule_turn("LEFT", ACTION_PRIORITY["TURN LEFT"], dist_cm)
-
-    def _on_dead_end(self, _t, _dist_cm):
-        self.search_entry_yaw = self.robot_yaw
-        self._enter_state("SEARCHING", ACTION_PRIORITY["DEAD END"])
-
-    # ================================================================
-    #  TURN SCHEDULING
-    # ================================================================
-
-    def _schedule_turn(self, direction: str, priority: int, dist_cm: float) -> None:
-        """Drive (dist_cm + TURN_DISTANCE_OFFSET_CM) to the turn point, then turn.
-        Marks the turn as inevitable — a STOP encountered en-route will not cancel it."""
-        self.pending_turn_direction  = direction
-        self.pending_turn_priority   = priority
-        self.target_travel_dist      = (dist_cm + TURN_DISTANCE_OFFSET_CM) / 100.0
-        self.action_start_x          = self.robot_x
-        self.action_start_y          = self.robot_y
-        self.inevitable_turn_pending = True
-        self.get_logger().info(
-            f"Turn scheduled: {direction} | detected={dist_cm:.1f}cm "
-            f"→ approach={self.target_travel_dist*100:.1f}cm (+{TURN_DISTANCE_OFFSET_CM}cm)")
-        self._enter_state("APPROACHING", priority)
-
-    def _schedule_forward(self, priority: int, dist_cm: float) -> None:
-        """Drive (dist_cm + FORWARD_DISTANCE_OFFSET_CM) past a FORWARD sign, then
-        resume normal line-following. The "NONE" direction sentinel distinguishes
-        this from a turn approach — _tick_approaching routes to FOLLOW_LINE on
-        completion instead of executing a rotation.
-        During the approach, the directional lock (set by _process_detections)
-        prevents any other directional sign from being accepted — this is what
-        makes FORWARD commit-and-hold rather than fire-and-forget."""
-        self.pending_turn_direction  = "NONE"
-        self.pending_turn_priority   = priority
-        self.target_travel_dist      = (dist_cm + FORWARD_DISTANCE_OFFSET_CM) / 100.0
-        self.action_start_x          = self.robot_x
-        self.action_start_y          = self.robot_y
-        self.inevitable_turn_pending = False   # no turn to resume after a STOP
-        self.get_logger().info(
-            f"Forward scheduled: detected={dist_cm:.1f}cm "
-            f"→ approach={self.target_travel_dist*100:.1f}cm (+{FORWARD_DISTANCE_OFFSET_CM}cm)")
-        self._enter_state("APPROACHING", priority)
-
-    def _command_dynamic_turn(self, direction: str, priority: int) -> None:
-        """Begin a dynamic turn; exits when min angle turned AND line re-acquired."""
-        self.pending_turn_direction  = direction
-        self.turn_entry_yaw          = self.robot_yaw
-        self.inevitable_turn_pending = False   # turn is now executing — no longer pending
-        self._enter_state("TURNING_DYNAMIC", priority)
-
-    # ================================================================
-    #  STATE TICK HANDLERS
-    # ================================================================
-
-    def _tick_follow_line(self, twist: Twist, t: float,
-                          line_ok: bool, heading_err: float, lat_err_px: float):
-        """
-        EMA-smoothed centroid lateral PID.
-
-        Lost-line behaviour:
-          • Line lost (and wiggle not yet completed) → begin/continue ONE wiggle
-            cycle (right → centre → left → centre). Robot only rotates in place,
-            never drives forward.
-          • Line found at ANY moment (including mid-wiggle) → cancel wiggle,
-            reset PID, resume following. One clean handover.
-          • Wiggle cycle completes without finding the line → robot stops and
-            stays stopped until the line physically reappears.
-        """
-        # ── Line lost ────────────────────────────────────────────────
-        if not line_ok:
-            if self._wiggle_done:
-                # Already wiggled once this episode — just wait. Do NOT drive.
-                return                          # twist stays zero
-
-            # Begin or continue the single wiggle cycle. Never drives forward.
-            if self._wiggle_phase == 0:
-                self._reset_pid()               # reset PID once, on entry
-            self._tick_wiggle(twist)
-            return
-
-        # ── Line visible ─────────────────────────────────────────────
-        # Interruptible wiggle: if the line is (re-)found at ANY point —
-        # including mid-rotation — cancel the wiggle and hand to PID.
-        # The next line loss will begin a fresh cycle from the new pose.
-        if self._wiggle_phase != 0:
-            self.get_logger().info(
-                f"Line found during wiggle phase {self._wiggle_phase} — "
-                f"cancelling and resuming PID.")
-        self._wiggle_phase = 0
-        self._wiggle_done  = False
-
-        # ── Normal PID line-follow ───────────────────────────────────
-        if self.last_pid_time == 0.0:
-            dt = CONTROL_LOOP_PERIOD
-        else:
-            dt = max(t - self.last_pid_time, 1e-4)
-        self.last_pid_time = t
-
-        self.smooth_error = (EMA_ALPHA * lat_err_px
-                             + (1.0 - EMA_ALPHA) * self.smooth_error)
-        error = self.smooth_error
-
-        self.integral = float(np.clip(
-            self.integral + error * dt, -MAX_WINDUP, MAX_WINDUP))
-        derivative  = (error - self.prev_error) / dt
-        self.prev_error = error
-
-        pid_out  = KP * error + KI * self.integral + KD * derivative
-        yaw_cmd  = float(np.clip(-pid_out * SENSITIVITY, -MAX_ANGULAR, MAX_ANGULAR))
-
-        speed = FORWARD_SPEED * (0.5 if abs(lat_err_px) > SEVERE_LATERAL_OFFSET
-                                  else 1.0)
-
-        twist.linear.x  = speed
-        twist.angular.z = yaw_cmd
-
-    # ------------------------------------------------------------------
-    def _tick_wiggle(self, twist: Twist) -> None:
-        """
-        Lost-line search wiggle — runs entirely inside FOLLOW_LINE, no new states.
-
-        Phase sequence (odometry-driven):
-          1 → rotate RIGHT  45°  from origin
-          2 → return to neutral  (0°)
-          3 → rotate LEFT   45°  from origin
-          4 → return to neutral  (0°)
-          5 → stop (give up — no adjacent line found)
-
-        At every phase, if the camera finds a line the caller (_tick_follow_line)
-        immediately cancels the wiggle and hands control back to PID.
-        """
-        wiggle_rad  = math.radians(LOST_LINE_WIGGLE_ANGLE_DEG)
-        centre_rad  = math.radians(LOST_LINE_CENTER_THRESH_DEG)
-
-        if self._wiggle_phase == 0:
-            # First lost frame — record origin yaw and begin phase 1
-            self._wiggle_origin_yaw = self.robot_yaw
-            self._wiggle_phase = 1
-            self.get_logger().info("Line lost — starting search wiggle (R→C→L→C→stop).")
-
-        diff = self._yaw_diff(self.robot_yaw, self._wiggle_origin_yaw)
-
-        if self._wiggle_phase == 1:                        # ── turn RIGHT ──
-            if diff <= -wiggle_rad:
-                self._wiggle_phase = 2
-                self.get_logger().info("Wiggle: right done — returning to centre.")
-            else:
-                twist.angular.z = -LOST_LINE_WIGGLE_SPEED
-
-        elif self._wiggle_phase == 2:                      # ── back to centre ──
-            if abs(diff) <= centre_rad:
-                self._wiggle_phase = 3
-                self.get_logger().info("Wiggle: centred — turning left.")
-            else:
-                twist.angular.z = LOST_LINE_WIGGLE_SPEED  # turn left to return
-
-        elif self._wiggle_phase == 3:                      # ── turn LEFT ──
-            if diff >= wiggle_rad:
-                self._wiggle_phase = 4
-                self.get_logger().info("Wiggle: left done — returning to centre.")
-            else:
-                twist.angular.z = LOST_LINE_WIGGLE_SPEED
-
-        elif self._wiggle_phase == 4:                      # ── back to centre ──
-            if abs(diff) <= centre_rad:
-                self._wiggle_phase = 5
-                self._wiggle_done  = True
-                self.get_logger().info(
-                    "Wiggle complete — no line found. Robot stopped, "
-                    "awaiting manual relocation.")
-            else:
-                twist.angular.z = -LOST_LINE_WIGGLE_SPEED  # turn right to return
-
-        elif self._wiggle_phase == 5:                      # ── give up ──
-            pass                                            # twist stays zero
-
-    # ------------------------------------------------------------------
-    def _tick_approaching(self, twist: Twist, t: float,
-                          line_ok: bool, heading_err: float, lat_err_px: float):
-        traveled = math.hypot(
-            self.robot_x - self.action_start_x,
-            self.robot_y - self.action_start_y,
-        )
-        if traveled >= self.target_travel_dist:
-            if self.pending_turn_direction == "NONE":
-                # FORWARD approach completed — just resume line following.
-                self.get_logger().info(
-                    f"Forward approach done ({traveled:.2f} m) — resuming follow.")
-                self._enter_state("FOLLOW_LINE")
-            else:
-                self.get_logger().info(
-                    f"Approach done ({traveled:.2f} m) — starting dynamic turn.")
-                self._command_dynamic_turn(
-                    self.pending_turn_direction, self.pending_turn_priority)
-            return
-
-        if line_ok:
-            # Line visible — PID steers us to the junction
-            self._tick_follow_line(twist, t, line_ok, heading_err, lat_err_px)
-        else:
-            # Line lost at the junction (horizontal tape, gap, or turn point).
-            # Drive straight at base speed — odometry still tracks distance,
-            # so the turn will trigger correctly when target_travel_dist is reached.
-            # Do NOT stop here; stopping = traveled never increases = deadlock.
-            twist.linear.x = FORWARD_SPEED
-
-    # ------------------------------------------------------------------
-    def _tick_stopping(self, twist: Twist, t: float,
-                       line_ok: bool, heading_err: float, lat_err_px: float):
-        if t - self.state_entry_time >= STOP_DURATION_SEC:
-            if self.inevitable_turn_pending:
-                # A turn was scheduled before the stop — resume the approach.
-                # action_start and target_travel_dist are still set from _schedule_turn;
-                # robot didn't move during STOPPING so odometry resumes correctly.
-                self.get_logger().info(
-                    "STOP complete — inevitable turn pending, resuming approach.")
-                self._enter_state("APPROACHING", self.pending_turn_priority)
-            else:
-                self.get_logger().info("STOP complete — resuming line follow.")
-                self._enter_state("FOLLOW_LINE")
-        # twist stays at zero while waiting
-
-    # ------------------------------------------------------------------
-    def _tick_turning_dynamic(self, twist: Twist, t: float,
-                              line_ok: bool, heading_err: float, lat_err_px: float):
-        """
-        Bang-bang turn in the commanded direction.
-
-        Exit condition (both must be true simultaneously):
-          1. Odometry confirms >= DYNAMIC_TURN_MIN_ANGLE_DEG has been turned
-             — prevents the line follower latching onto the *original* path
-             before the robot has meaningfully rotated.
-          2. The line follower detects a valid (non-horizontal) line.
-
-        As soon as both are true, angular.z is left at zero (twist is not
-        written before returning) and FOLLOW_LINE takes over — the two
-        states cannot overlap.
-        """
-        angle_turned = abs(self._yaw_diff(self.robot_yaw, self.turn_entry_yaw))
-        min_angle_rad = math.radians(DYNAMIC_TURN_MIN_ANGLE_DEG)
-
-        if angle_turned >= min_angle_rad and line_ok:
-            self.get_logger().info(
-                f"Dynamic turn done — turned {math.degrees(angle_turned):.1f}°, "
-                f"line latched (l_err={lat_err_px:.1f}px)")
-            self._enter_state("FOLLOW_LINE")
-            return   # twist.angular.z stays 0 — clean handover, no overlap
-
-        # Minimum angle not yet met, or line not yet seen — keep turning
-        twist.angular.z = (TURN_SPEED
-                           if self.pending_turn_direction == "LEFT"
-                           else -TURN_SPEED)
-
-    # ------------------------------------------------------------------
-    def _tick_searching(self, twist: Twist, t: float,
-                        line_ok: bool, heading_err: float, lat_err_px: float):
-        """
-        Sweeps left then right looking for an alternate path.
-        heading_err (from fitLine — NOT the PID error) detects branch lines.
-        Times out into a 180° odometry-guided retreat.
-        """
-        elapsed = t - self.state_entry_time
-
-        # Alternate path found
-        if line_ok and abs(heading_err) > SEARCH_PATH_ANGLE:
-            direction = "LEFT" if heading_err > 0 else "RIGHT"
-            self.get_logger().info(
-                f"Alternate path found ({direction}, h_err={heading_err:.2f}rad).")
-            self._command_dynamic_turn(direction, ACTION_PRIORITY["DEAD END"])
-            return
-
-        # Timeout — 180° fixed retreat
-        if elapsed >= SEARCH_TIMEOUT_SEC:
-            self.get_logger().info("Search timeout — 180° retreat.")
-            self.target_yaw = math.atan2(
-                math.sin(self.search_entry_yaw + math.pi),
-                math.cos(self.search_entry_yaw + math.pi),
-            )
-            # TURNING_FIXED handled directly in _control_loop (no line args needed)
-            self.nav_state        = "TURNING_FIXED"
-            self.active_priority  = ACTION_PRIORITY["DEAD END"]
-            self.state_entry_time = t
-            return
-
-        twist.angular.z = (SEARCH_TURN_SPEED
-                           if elapsed < SEARCH_TIMEOUT_SEC / 2.0
-                           else -SEARCH_TURN_SPEED)
-
-    # ------------------------------------------------------------------
-    def _tick_turning_fixed(self, twist: Twist) -> None:
-        """Odometry-guided fixed-yaw turn — used only for 180° retreat."""
-        diff = self._yaw_diff(self.target_yaw, self.robot_yaw)
-        if abs(diff) < TURN_DONE_THRESH:
-            self.get_logger().info("180° retreat done — resuming line follow.")
-            self._enter_state("FOLLOW_LINE")
-        else:
-            twist.angular.z = TURN_SPEED if diff > 0 else -TURN_SPEED
-
-    # ================================================================
-    #  DETECTION PROCESSING
-    # ================================================================
-
-    def _process_detections(self, t: float, detections: list) -> None:
-        valid_bypasses = ["LEFT", "RIGHT", "TURN LEFT", "TURN RIGHT", "FORWARD", "GO FORWARD"]
-        in_cooldown    = t <= self.cooldown_until
-        is_searching   = self.nav_state == "SEARCHING"
-
-        # Re-usable detection validator (shared between cooldown STOP-override,
-        # the compound STOP+TURN rule, and the intersection-proximity rule).
-        def _valid_det(d):
-            """Re-apply filters so we only act on detections that would pass normal selection."""
-            lbl = d['label']
-            if lbl == "NO ENTRY" and d['distance'] < NO_ENTRY_MIN_DISTANCE_CM:
-                return False
-            if lbl not in TURN_LABELS and lbl not in valid_bypasses \
-                    and d['distance'] > ACTION_DISTANCE_CM:
-                return False
-            # STOP-specific cooldown: once a STOP has fired, ignore STOP detections
-            # for STOP_COOLDOWN_SEC so the robot doesn't re-trigger on the same sign.
-            if lbl == "STOP" and t <= self.stop_cooldown_until:
-                return False
-            if TEMPORAL_FILTER_ENABLED and \
-                    sum(self._detection_window.get(lbl, [])) < DETECTION_MIN_COUNT:
-                return False
-            return True
-
-        # Clear the directional lock when its cooldown window has ended.
-        # (STOP / NO ENTRY / DEAD END cooldowns also clear it — they run their
-        # own actions and by the time cooldown ends, a fresh decision is fine.)
-        if not in_cooldown and self._directional_lock_label is not None:
-            self._directional_lock_label = None
-
-        if in_cooldown:
-            # Higher-priority signs (e.g. STOP during a turn approach) can override cooldown.
-            has_priority_override = any(
-                ACTION_PRIORITY.get(d['label'], 0) > self.active_priority
-                for d in detections
-            )
-            if not has_priority_override and not (
-                    is_searching and any(d['label'] in valid_bypasses for d in detections)):
-                return
-
-        best_label    = None
-        best_priority = -1
-        best_dist     = math.inf
-
-        # ── Compound rule: STOP + TURN in same frame ────────────────
-        # Must be detected before the normal priority contest, because TURN
-        # outranks STOP and would otherwise shadow the stop entirely.
-        # The robot stops for STOP_DURATION_SEC, then resumes the approach to
-        # complete the turn (existing inevitable_turn_pending logic handles resume).
-
-        has_stop = any(d['label'] == "STOP" and _valid_det(d) for d in detections)
-        turn_det = next((d for d in detections
-                         if d['label'] in TURN_LABELS and _valid_det(d)), None)
-
-        # Closest non-turn instruction (STOP or FORWARD) for the proximity check
-        fwd_labels = {"FORWARD", "GO FORWARD"}
-        stop_det   = next((d for d in detections
-                           if d['label'] == "STOP" and _valid_det(d)), None)
-        fwd_det    = next((d for d in detections
-                           if d['label'] in fwd_labels and _valid_det(d)), None)
-
-        # ── Intersection proximity rule ─────────────────────────────
-        # Multiple signs at a junction → the one closest to the robot OWNS this
-        # intersection. If STOP or FORWARD is closer than the turn sign by
-        # INTERSECTION_PROXIMITY_CM, the turn belongs to the *next* intersection
-        # and must be rejected now.
-        if turn_det is not None:
-            nearer = None
-            if stop_det is not None and \
-                    stop_det['distance'] < turn_det['distance'] - INTERSECTION_PROXIMITY_CM:
-                nearer = stop_det
-            elif fwd_det is not None and \
-                    fwd_det['distance'] < turn_det['distance'] - INTERSECTION_PROXIMITY_CM:
-                nearer = fwd_det
-
-            if nearer is not None:
-                self.get_logger().info(
-                    f"Turn rejected: {nearer['label']} @ {nearer['distance']:.1f}cm "
-                    f"is closer than {turn_det['label']} @ {turn_det['distance']:.1f}cm "
-                    f"(margin ≥ {INTERSECTION_PROXIMITY_CM}cm) — {nearer['label']} owns this intersection.")
-                turn_det = None   # Drop the turn; proceed with normal selection
-
-        if has_stop and turn_det is not None and not in_cooldown:
-            self.get_logger().info(
-                f"Compound STOP+{turn_det['label']} — stopping, then turning "
-                f"at {turn_det['distance']:.1f}cm.")
-            # Schedule the turn first (sets inevitable_turn_pending + travel target),
-            # then override into STOPPING. Post-STOP logic in _tick_stopping will
-            # resume APPROACHING automatically.
-            direction = "LEFT" if turn_det['label'] == "TURN LEFT" else "RIGHT"
-            self._schedule_turn(direction, ACTION_PRIORITY[turn_det['label']],
-                                turn_det['distance'])
-            self._enter_state("STOPPING", ACTION_PRIORITY["STOP"])
-            self.cooldown_until = t + SIGN_COOLDOWN_SEC
-            self.stop_cooldown_until = t + STOP_COOLDOWN_SEC   # arm per-label STOP lockout
-            # Lock directional choice on the turn that was armed
-            self._directional_lock_label = turn_det['label']
-            return
-
-        for det in detections:
-            label    = det['label']
-            is_escape = is_searching and label in valid_bypasses
-
-            # Distance gate:
-            #   TURN signs  — no upper cap. They fire at first detection and that
-            #                  detected distance becomes the approach distance, so the
-            #                  robot drives to exactly where the sign is before turning.
-            #   All others  — must be within ACTION_DISTANCE_CM (escape signs bypass).
-            if not is_escape and label not in TURN_LABELS \
-                    and det['distance'] > ACTION_DISTANCE_CM:
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: beyond {ACTION_DISTANCE_CM}cm")
+    def _vision_worker(self) -> None:
+        prev, last_map = time.time(), 0.0
+        while self._running:
+            ok, frame = self._cap.read()
+            if not ok:
+                time.sleep(0.05)
                 continue
+            result = self.vision.process(frame)
+            now = time.time()
+            fps, prev = 1.0 / max(now - prev, 1e-6), now
+            with self._vis_lock:
+                self._vis = result
+                self._vis_seq += 1
 
-            # NO ENTRY: reject when too close — model misclassifies other signs at short range
-            if label == "NO ENTRY" and det['distance'] < NO_ENTRY_MIN_DISTANCE_CM:
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: too close (min {NO_ENTRY_MIN_DISTANCE_CM}cm)")
+            if not SHOW_WINDOWS:
                 continue
-
-            # STOP-specific cooldown: 10s after a STOP fires, same sign can't retrigger.
-            if label == "STOP" and t <= self.stop_cooldown_until:
-                self.get_logger().debug(
-                    f"[det] STOP @ {det['distance']:.1f}cm — SKIP: STOP cooldown "
-                    f"({self.stop_cooldown_until - t:.1f}s remaining)")
-                continue
-
-            # Temporal filter: label must be confirmed in >= N of last M ticks
-            if TEMPORAL_FILTER_ENABLED and \
-                    sum(self._detection_window.get(label, [])) < DETECTION_MIN_COUNT:
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: temporal filter "
-                    f"({sum(self._detection_window.get(label,[]))}/{DETECTION_MIN_COUNT})")
-                continue
-
-            priority = ACTION_PRIORITY.get(label, 0)
-
-            if in_cooldown and not is_escape:
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: cooldown active")
-                continue
-
-            # Directional lock: FORWARD / TURN LEFT / TURN RIGHT are first-come-
-            # first-served. Once one is committed, reject any OTHER directional
-            # label until the lock clears. Same-label re-detections pass through
-            # (they'll be filtered by cooldown anyway, but this keeps the logic clean).
-            if (label in DIRECTIONAL_LABELS
-                    and self._directional_lock_label is not None
-                    and label != self._directional_lock_label
-                    and not is_escape):
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: "
-                    f"directional lock held by {self._directional_lock_label}")
-                continue
-
-            if priority < self.active_priority and not is_escape:
-                self.get_logger().debug(
-                    f"[det] {label} @ {det['distance']:.1f}cm — SKIP: priority {priority} < active {self.active_priority}")
-                continue
-
-            if (priority > best_priority or
-                    (priority == best_priority and det['distance'] < best_dist)):
-                best_label    = label
-                best_priority = priority
-                best_dist     = det['distance']
-
-        if best_label and best_label in self._action_dispatch:
-            self.get_logger().info(
-                f"Sign accepted → {best_label}  "
-                f"dist={best_dist:.1f}cm  pri={best_priority}")
-            self.cooldown_until = t + SIGN_COOLDOWN_SEC
-            if best_label == "STOP":
-                self.stop_cooldown_until = t + STOP_COOLDOWN_SEC   # arm per-label STOP lockout
-            # Record directional lock if this was a directional sign
-            if best_label in DIRECTIONAL_LABELS:
-                self._directional_lock_label = best_label
-                self.get_logger().info(
-                    f"Directional lock set → {best_label}. Other directional "
-                    f"signs will be ignored until cooldown clears.")
-            self._action_dispatch[best_label](t, best_dist)
-        elif best_label:
-            self.get_logger().warn(
-                f"[det] {best_label} passed all filters but has NO dispatch handler — "
-                f"check label name matches action_dispatch keys")
+            d = result.display
+            cv2.putText(d, f"FPS {fps:.0f}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(d, self._hud, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+            cv2.imshow("LIMO Vision + YOLO", d)
+            cv2.imshow("Green Mask (ROI)", result.mask)
+            if now - last_map >= MAP_RENDER_PERIOD:
+                img = self.mapper.render()
+                if img is not None:
+                    cv2.imshow("VSLAM Map", img)
+                last_map = now
+            cv2.waitKey(1)
 
     # ================================================================
-    #  CONTROL LOOP  (10 Hz)
+    #  CONTROL LOOP
     # ================================================================
 
     def _control_loop(self) -> None:
         twist = Twist()
-        t     = self._now()
+        if self.odom_ok:
+            with self._vis_lock:
+                vis, seq = self._vis, self._vis_seq
+            self.mapper.add_pose(self.x, self.y, self.yaw, self._now())
+            if vis is not None:
+                if seq != self._last_seq:          # each camera frame is used once
+                    self._last_seq = seq
+                    self._on_new_frame(vis)
+                self._tick(twist, vis.line)
+            self._hud = f"{self.state} | {self.plan.summary() if self.plan else 'no plan'}"
+        self._watchdog(twist)
+        self.cmd_pub.publish(twist)
 
-        if not self.odom_ok:
-            self._publish_cmd(twist)
+    # ------------------------------------------------------------------
+    def _on_new_frame(self, vis: VisionResult) -> None:
+        for s in vis.signs:
+            if s.fwd_cm <= MAP_MAX_SIGN_RANGE_CM:
+                self.mapper.add_landmark(s.label, *self._to_world(s.fwd_centre_cm, s.lat_cm))
+
+        if self.zone and math.hypot(self.x - self.zone[0], self.y - self.zone[1]) \
+                > HANDLED_ZONE_CLEAR_CM / 100.0:
+            self.zone = None
+
+        # Remember the junction in odometry: once the crossing tape is under the
+        # camera the per-frame gate goes blind, but signs past it (other
+        # approaches' quadrant-1 signs) must stay rejected until we're through.
+        if vis.junction_cm is not None and self.state in ("FOLLOW", "STOP", "CROSS"):
+            self.junction_odo = self.odometer + vis.junction_cm / 100.0
+        elif self.junction_odo is not None and \
+                self.odometer > self.junction_odo + JUNCTION_MEMORY_CM / 100.0:
+            self.junction_odo = None
+
+        # Only read signs while driving the lane (or waiting at a STOP).
+        # During TURN/UTURN/CROSS/LOST the camera sweeps across other lanes.
+        if self.state not in ("FOLLOW", "STOP"):
             return
+        for s in vis.signs:
+            if (not s.reject and not s.centre_lane and self.junction_odo is not None
+                    and self.odometer + s.fwd_centre_cm / 100.0
+                    > self.junction_odo + JUNCTION_MARGIN_CM / 100.0):
+                s.reject = "past junction"
+            if s.reject:
+                continue
+            xy = self._to_world(s.fwd_centre_cm, s.lat_cm)
+            if self.zone and math.hypot(xy[0] - self.zone[0], xy[1] - self.zone[1]) \
+                    < HANDLED_ZONE_RADIUS_CM / 100.0:
+                continue    # belongs to the junction we just handled
+            if self.plan is None:
+                self.plan = JunctionPlan()
+                self.get_logger().info(f"Sign sighted: {s.label} @ {s.fwd_cm:.0f}cm "
+                                       f"(lat {s.lat_cm:+.0f}cm) — building junction plan")
+            self.plan.add(s, self.odometer + s.fwd_cm / 100.0, xy)
 
-        with self._vis_lock:
-            line_ok = self._line_ok
-            h_err   = self._heading_err
-            l_err   = self._lat_err_px
-            dets    = list(self._detections)
+    # ------------------------------------------------------------------
+    def _tick(self, twist: Twist, line: Line) -> None:
+        t = self._now()
+        st = self.state
 
-        # VSLAM map update
-        if t - self.last_map_update >= MAP_UPDATE_INTERVAL:
-            self.mapper.update(
-                self.robot_x, self.robot_y, self.robot_yaw, dets, t)
-            self.last_map_update = t
+        if st == "FOLLOW":
+            if self.plan and self._check_arrival():
+                return
+            if line.ok:
+                self._steer(twist, line)
+            elif self.plan:
+                twist.linear.x = FORWARD_SPEED    # bridge the junction toward the action
+            else:
+                self.wiggle = [wrap(self.yaw + math.radians(a)) for a in WIGGLE_ANGLES_DEG]
+                self._enter("LOST")
 
-        # Temporal filter: record presence/absence of every known label this tick
-        detected_now = {d['label'] for d in dets}
-        for label in ACTION_PRIORITY:
-            self._detection_window[label].append(1 if label in detected_now else 0)
+        elif st == "STOP":
+            if t - self.state_t >= STOP_DURATION_SEC:
+                if self.plan:
+                    self.plan.stop_done = True
+                self._enter("FOLLOW")
 
-        self._process_detections(t, dets)
+        elif st == "TURN":
+            self.turn_angle += self.turn_dir * wrap(self.yaw - self._turn_prev_yaw)
+            self._turn_prev_yaw = self.yaw
+            if (self.turn_angle >= math.radians(TURN_MIN_ANGLE_DEG) and line.ok
+                    and abs(line.heading) < TURN_EXIT_HEADING_RAD
+                    and abs(line.lateral) < TURN_EXIT_LATERAL):
+                self.get_logger().info(f"Turn done ({math.degrees(self.turn_angle):.0f}°).")
+                self._finish_plan("FOLLOW")
+            elif self.turn_angle >= math.radians(TURN_MAX_ANGLE_DEG):
+                self.get_logger().warn("Turn found no line — searching.")
+                self.wiggle = [wrap(self.yaw + math.radians(a)) for a in WIGGLE_ANGLES_DEG]
+                self._finish_plan("LOST")
+            else:
+                twist.angular.z = self.turn_dir * TURN_SPEED
 
-        # TURNING_FIXED has no line/heading args — handled separately
-        if self.nav_state == "TURNING_FIXED":
-            self._tick_turning_fixed(twist)
-        else:
-            handler = self._state_dispatch.get(self.nav_state)
-            if handler:
-                handler(twist, t, line_ok, h_err, l_err)
+        elif st == "UTURN":
+            if self._rotate_to(twist, self.target_yaw, TURN_SPEED):
+                self._finish_plan("FOLLOW")
 
-        # Motion watchdog: did the previous tick's command actually produce motion?
-        # Check is done before publishing the new command, using the command we
-        # published on the previous tick.
-        self._check_motion_watchdog(
-            t, self._wd_last_cmd_linear, self._wd_last_cmd_angular)
-        self._wd_last_cmd_linear  = twist.linear.x
-        self._wd_last_cmd_angular = twist.angular.z
+        elif st == "CROSS":
+            if self.odometer >= self.cross_end:
+                self._finish_plan("FOLLOW")
+            elif line.ok:
+                self._steer(twist, line)
+            else:
+                twist.linear.x = FORWARD_SPEED
 
-        self._publish_cmd(twist)
+        elif st == "LOST":
+            if line.ok:
+                self.get_logger().info("Line re-acquired.")
+                self._enter("FOLLOW")
+            elif t - self.state_t < GAP_COAST_SEC:
+                twist.linear.x = FORWARD_SPEED    # dashed tape: just keep going
+            elif self.wiggle:
+                if self._rotate_to(twist, self.wiggle[0], WIGGLE_SPEED):
+                    self.wiggle.pop(0)
+                    if not self.wiggle:
+                        self.get_logger().warn("No line found — waiting for the line.")
+
+    # ------------------------------------------------------------------
+    def _check_arrival(self) -> bool:
+        """Fire the junction plan when its trigger point is reached. True if state changed."""
+        r = self.plan.resolve()
+        odo, cm = self.odometer, 0.01
+
+        if not (r.direction or r.stop or r.roadblock):
+            if odo > r.anchor + PLAN_EXPIRE_CM * cm:
+                self.get_logger().info("Unconfirmed sightings passed — dropped.")
+                self.plan = None
+            return False
+
+        if odo > r.anchor + PLAN_ABORT_CM * cm:
+            self.get_logger().warn("Plan was never triggered — dropping it.")
+            self._finish_plan("FOLLOW")
+            return False
+
+        if r.stop and not self.plan.stop_done:
+            if odo >= r.odo[STOP] + STOP_OFFSET_CM * cm:
+                self.mapper.add_event("STOP", self.x, self.y, self._now())
+                self._enter("STOP")
+                return True
+            return False                       # stop comes first
+
+        if r.direction in (TURN_LEFT, TURN_RIGHT):
+            if odo >= r.odo[r.direction] + TURN_OFFSET_CM * cm:
+                self.turn_dir = 1 if r.direction == TURN_LEFT else -1
+                self.turn_angle, self._turn_prev_yaw = 0.0, self.yaw
+                return self._fire("TURN", r.direction.split()[-1])
+            return False
+
+        if r.direction == GO_FORWARD or not r.roadblock:
+            ref = r.odo[r.direction] if r.direction else r.anchor
+            if odo >= ref:
+                self.cross_end = ref + FORWARD_OFFSET_CM * cm
+                return self._fire("CROSS", "FORWARD")
+            return False
+
+        # Roadblock with no alternative direction → U-turn
+        if odo >= r.roadblock_odo - UTURN_STANDOFF_CM * cm:
+            self.target_yaw = wrap(self.yaw + math.pi)
+            return self._fire("UTURN", "UTURN")
+        return False
+
+    def _fire(self, state: str, action: str) -> bool:
+        """Start a junction manoeuvre; its start point becomes the handled zone."""
+        self._fire_xy = (self.x, self.y)
+        self.mapper.add_event(action, self.x, self.y, self._now())
+        self._enter(state)
+        return True
+
+    def _finish_plan(self, next_state: str) -> None:
+        # Zone = where the manoeuvre started (≈ junction centre for a turn), so
+        # every corner sign of this junction is ignored while we leave it.
+        if self.plan:
+            self.zone = self._fire_xy or self.plan.resolve().anchor_xy
+        self.plan = None
+        self._fire_xy = None
+        self.junction_odo = None    # heading may have changed — re-detect
+        self._enter(next_state)
+
+    # ------------------------------------------------------------------
+    def _watchdog(self, twist: Twist) -> None:
+        """Warn if we keep commanding motion but odometry doesn't change."""
+        if not (WATCHDOG_ENABLED and self.odom_ok):
+            return
+        t, pose = self._now(), (self.x, self.y, self.yaw)
+        commanding = (abs(twist.linear.x) >= WATCHDOG_MIN_CMD_LINEAR or
+                      abs(twist.angular.z) >= WATCHDOG_MIN_CMD_ANGULAR)
+        ref = self._wd_ref
+        if (not commanding or ref is None
+                or math.hypot(pose[0] - ref[1][0], pose[1] - ref[1][1]) > WATCHDOG_POSITION_EPS_M
+                or abs(wrap(pose[2] - ref[1][2])) > WATCHDOG_YAW_EPS_RAD):
+            self._wd_ref = (t, pose)
+            return
+        if t - ref[0] > WATCHDOG_STALL_TIMEOUT_S and t - self._wd_warned > WATCHDOG_STALL_TIMEOUT_S:
+            self.get_logger().warn(
+                f"Motion watchdog: commanding lin={twist.linear.x:+.3f} ang={twist.angular.z:+.3f} "
+                f"for {t - ref[0]:.1f}s but odometry isn't changing — check base node, "
+                f"motor power and cabling.")
+            self._wd_warned = t
 
     # ================================================================
     #  SHUTDOWN
     # ================================================================
 
     def shutdown(self) -> None:
-        self.get_logger().info("Saving VSLAM map…")
-        self.mapper.save_map()
-        self.get_logger().info(f"Map saved → {MAP_SAVE_PATH}")
-        self.cap.release()
+        self._running = False
+        try:
+            self.cmd_pub.publish(Twist())
+        except Exception:
+            pass
+        self._worker.join(timeout=2.0)
+        self._cap.release()
+        self.mapper.save()
+        print(f"[vision_slam_node] Map saved → {MAP_SAVE_PATH}")
 
 
 # ============================================================
@@ -1631,13 +1048,13 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Keyboard interrupt — shutting down.")
+        pass
     finally:
         node.shutdown()
-        node.cmd_pub.publish(Twist())
         node.destroy_node()
         cv2.destroyAllWindows()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
