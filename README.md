@@ -22,6 +22,8 @@
 [![Control](https://img.shields.io/badge/control_loop-20_Hz-blue?style=flat-square)](#-architecture)
 [![Tests](https://img.shields.io/badge/offline_sim-22_checks-brightgreen?style=flat-square)](#-offline-simulation)
 [![Course](https://img.shields.io/badge/COSC_4366EL-Group_5-8A2BE2?style=flat-square)](#-coursework-history)
+[![Team](https://img.shields.io/badge/team-solo_(1_member)-critical?style=flat-square)](#-authorship)
+[![Model](https://img.shields.io/badge/dataset_%26_model-by_author-orange?style=flat-square)](#-authorship)
 
 <br/>
 
@@ -31,7 +33,8 @@
 [Quick start](#-quick-start) •
 [Tuning](#-tuning-guide) •
 [Simulation](#-offline-simulation) •
-[Repo layout](#-repository-layout)
+[Repo layout](#-repository-layout) •
+[Authorship](#-authorship)
 
 </div>
 
@@ -50,6 +53,9 @@ A single ROS 2 node (`COSC_4366EL_A3_G5.py`) that drives an **AgileX LIMO** arou
 | 🗳️ | **Junction planning** | Multi-frame voting absorbs model flicker; actions fire on odometry distance, even after the sign leaves view |
 | 🗺️ | **VSLAM map** | Odometry trajectory + sign landmarks at their true bearing, rendered live and saved to JSON |
 | 🐕 | **Motion watchdog** | Warns when commands are sent but odometry doesn't move |
+
+> [!NOTE]
+> 👤 **Solo project.** Group 5 had one member. Everything here was done by [**xuckless**](https://github.com/xuckless), from collecting and annotating the dataset and training the model to the navigation code and on-robot tuning. See [Authorship](#-authorship).
 
 > [!IMPORTANT]
 > **Why lane gating matters.** Signs lie flat on the floor, so a **GO FORWARD** arrow meant for traffic crossing from the left points *right* from this robot's view, and the model correctly reads it as **TURN RIGHT**. No confidence threshold can fix that. Deciding *which signs belong to us* by where they sit on the floor does.
@@ -249,7 +255,7 @@ The scenarios include 20% detection dropout, ±1 cm position noise and 30% LEFT�
 | 4 | `TURN LEFT` | Direction |
 | 5 | `TURN RIGHT` | Direction |
 
-Dataset: [`robotics-vision`](https://universe.roboflow.com/syeds-workspace-csb5t/robotics-vision) on Roboflow Universe (CC BY 4.0), 272 images at 640×640, with exposure augmentation.
+Dataset: [`robotics-vision`](https://universe.roboflow.com/syeds-workspace-csb5t/robotics-vision) on Roboflow Universe (CC BY 4.0), 272 images at 640×640, with exposure augmentation. **Collected, annotated, split and published by the author**, who also trained the model (YOLOv8n). See [Authorship](#-authorship).
 
 > [!NOTE]
 > When retraining, set `fliplr=0`. Ultralytics mirrors images by default, which turns TURN LEFT into TURN RIGHT while keeping the label. Also check that `train:` in `data.yaml` points at `train/images`.
@@ -301,6 +307,24 @@ Dataset: [`robotics-vision`](https://universe.roboflow.com/syeds-workspace-csb5t
 
 ---
 
+## 👤 Authorship
+
+This was a **one-person group**. Every stage of the project was done by [**xuckless**](https://github.com/xuckless):
+
+| Stage | Work done |
+|---|---|
+| 📸 **Data collection & curation** | Gathered and curated the sign images for all 6 classes |
+| 🏷️ **Annotation** | Hand-labelled every bounding box (240 sign instances in the training set) in Roboflow |
+| ✂️ **Train / valid / test splits** | Built and checked the splits (240 / 20 / 12 images) and the preprocessing + augmentation pipeline |
+| 🧠 **Model training** | Fine-tuned **YOLOv8n** (Ultralytics, 640 px, batch 16) and deployed the weights to Roboflow |
+| 🤖 **Robot software** | Designed the algorithms, state machines and process flow across A1–A3 |
+| 🔧 **Testing & tuning** | All on-robot trial-and-error testing and constant tuning on the LIMO |
+
+> [!NOTE]
+> Claude Code was used as a development accelerator for the code. The ideas, core decisions and all of the data / model work are the author's own. See the disclaimer at the top of `COSC_4366EL_A3_G5.py`.
+
+---
+
 ## 📜 Coursework history
 
 | Assignment | File | Topic |
@@ -314,6 +338,6 @@ Dataset: [`robotics-vision`](https://universe.roboflow.com/syeds-workspace-csb5t
 
 ---
 
-Built by [**xuckless**](https://github.com/xuckless) for **COSC 4366EL** · developed with AI assistance (see the header of `COSC_4366EL_A3_G5.py`)
+Built **solo** by [**xuckless**](https://github.com/xuckless) for **COSC 4366EL**: dataset, annotation, model training, robot software and tuning
 
 </div>
